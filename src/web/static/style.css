@@ -434,7 +434,8 @@ button.plain .icon {
   color: var(--green-text);
 }
 
-[data-status="expired"] .account-text small {
+[data-status="expired"] .account-text small,
+[data-status="invalid"] .account-text small {
   color: var(--orange-text);
 }
 
@@ -464,7 +465,8 @@ button.plain .icon {
 }
 
 [data-status="valid"] .avatar,
-[data-status="expired"] .avatar {
+[data-status="expired"] .avatar,
+[data-status="invalid"] .avatar {
   background: var(--accent);
 }
 
@@ -483,7 +485,8 @@ button.plain .icon {
   background: var(--green);
 }
 
-[data-status="expired"] .avatar::after {
+[data-status="expired"] .avatar::after,
+[data-status="invalid"] .avatar::after {
   background: var(--orange);
 }
 

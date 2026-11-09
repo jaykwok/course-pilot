@@ -33,8 +33,19 @@ function fixture(statuses: number[]) {
     },
     async evaluate() {
       assert.equal(ready, true, "requests must await SPA token readiness");
+      return "synthetic-token";
+    },
+    async fetch(_url: string, options: any) {
+      assert.equal(options.signal, lease.signal);
+      assert.equal(options.timeout, 10000);
+      assert.equal(options.mode, "same-origin");
       sends++;
-      return { status: statuses.shift(), value: { data: "ok" } };
+      const status = statuses.shift()!;
+      return {
+        status,
+        ok: status === 200,
+        body: JSON.stringify({ data: "ok" }),
+      };
     },
   } as unknown as Tab;
   return {
@@ -89,7 +100,6 @@ test("API errors retain JSON business reasons and endpoint without exposing requ
       runInNewContext(`(${fn.toString()})`, {
         location: { origin: "https://kc.zhixueyun.com" },
         document: { cookie: "authorization=test-token" },
-        AbortSignal,
         window: {
           require(name: string) {
             assert.equal(name, "./app/util/errors");
@@ -99,17 +109,19 @@ test("API errors retain JSON business reasons and endpoint without exposing requ
             };
           },
         },
-        fetch: async () => {
-          requests++;
-          const response = new Response(body, {
-            status,
-            headers: { "Content-Type": contentType },
-          });
-          if (!contentType) response.headers.delete("Content-Type");
-          return response;
-        },
       })(arg),
     );
+    t.mock.method(f.tab, "fetch", async (_url: string, options: any) => {
+      requests++;
+      assert.equal(options.headers.Authorization, "test-token");
+      assert.equal(options.responseType, "text");
+      return {
+        status,
+        ok: false,
+        body,
+        headers: { "content-type": contentType },
+      };
+    });
     await assert.rejects(
       f.http.json("/api/class?token=private-query"),
       (error: Error) => {
@@ -135,4 +147,82 @@ test("API authentication failure invalidates lease without retry; cancellation s
     fixture([200]).http.json("https://outside.test/api/read"),
     /允许范围/,
   );
+});
+
+test("HTTP status handling does not depend on SPA error translation", async (t) => {
+  for (const statuses of [[401], [403], [503, 200], [422]]) {
+    const f = fixture([]);
+    let requests = 0,
+      translations = 0;
+    t.mock.method(f.tab, "evaluate", async (_fn: unknown, code: unknown) => {
+      if (code === undefined) return "synthetic-token";
+      translations++;
+      throw new Error("SPA error module unavailable");
+    });
+    t.mock.method(f.tab, "fetch", async () => {
+      const status = statuses[requests++];
+      return {
+        status,
+        ok: status === 200,
+        body: JSON.stringify(
+          status === 200
+            ? { data: "ok" }
+            : { errorCode: 123, message: "server diagnostic" },
+        ),
+      };
+    });
+    if (statuses[0] === 503) {
+      assert.deepEqual(await f.http.json("/api/read"), { data: "ok" });
+      assert.equal(requests, 2);
+      assert.equal(translations, 0);
+    } else if (statuses[0] === 422) {
+      await assert.rejects(f.http.json("/api/read"), (error: Error) => {
+        assert.ok(error instanceof ReviewRequired);
+        assert.match(error.message, /422.*123.*server diagnostic/);
+        assert.equal(error.recovery, "blocked");
+        return true;
+      });
+      assert.equal(requests, 1);
+      assert.equal(translations, 1);
+    } else {
+      await assert.rejects(f.http.json("/api/read"), AuthenticationError);
+      assert.equal(f.stats().invalidations, 1);
+      assert.equal(requests, 1);
+      assert.equal(translations, 0);
+    }
+  }
+});
+
+test("browser requests preserve JSON and form bodies and check the lease again before sending", async (t) => {
+  for (const [body, headers, expected] of [
+    [{ courseId: "course" }, {}, '{"courseId":"course"}'],
+    [
+      "examId=exam",
+      { "Content-Type": "application/x-www-form-urlencoded" },
+      "examId=exam",
+    ],
+  ] as const) {
+    const f = fixture([200]);
+    t.mock.method(f.tab, "fetch", async (_url: string, options: any) => {
+      assert.equal(options.method, "POST");
+      assert.equal(options.body, expected);
+      assert.equal(
+        options.headers["Content-Type"],
+        headers["Content-Type"] || "application/json",
+      );
+      assert.equal(options.signal, f.abort.signal);
+      return { status: 200, ok: true, body: '{"data":"ok"}' };
+    });
+    await f.http.json("/api/write", { method: "POST", body, headers });
+  }
+  const cancelled = fixture([200]);
+  t.mock.method(cancelled.tab, "evaluate", async () => {
+    cancelled.abort.abort(new Error("account changed"));
+    return "old-token";
+  });
+  await assert.rejects(
+    cancelled.http.json("/api/write", { method: "POST", body: {} }),
+    /account changed/,
+  );
+  assert.equal(cancelled.stats().sends, 0);
 });

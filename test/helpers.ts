@@ -25,7 +25,7 @@ export const SUBJECT =
 export async function application() {
   const temp = await temporary(),
     chrome = await ScriptedChrome.start(),
-    browser = await chrome.connect(),
+    browser = await chrome.connect({ inputPolicy: { mode: "human" } }),
     logger = new Logger(join(temp.dir, "logs"));
   const runtime = BrowserRuntime.fromBrowser(browser, logger),
     repo = new Repository(join(temp.dir, "data"));

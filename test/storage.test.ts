@@ -222,6 +222,37 @@ test("reference runs leave learning completion and queues unchanged", async () =
   }
 });
 
+test("completion reaches ancestors above a shared diamond in one update", async () => {
+  const temp = await temporary(),
+    repo = new Repository(temp.dir);
+  try {
+    const [root, shared, left, right] = ["root", "shared", "left", "right"].map(
+      (name) => {
+        const task = repo.upsert(
+          `https://cms.mylearning.cn/topic/${name}.html`,
+          "a",
+        );
+        repo.outcome(task.id, "WAITING_CHILDREN", { discoveryComplete: true });
+        repo.enqueue(task, "discover");
+        return task;
+      },
+    );
+    const course = repo.upsert(COURSE, "a");
+    repo.link(root, shared);
+    repo.link(shared, left);
+    repo.link(shared, right);
+    repo.link(left, course);
+    repo.link(right, course);
+    repo.complete(course, { finishStatus: 2 });
+    for (const task of [left, right, shared, root])
+      assert.equal(repo.task(task.id).status, "COMPLETED", task.url);
+    assert.deepEqual(repo.queue("a", "discover"), []);
+  } finally {
+    repo.close();
+    await temp.close();
+  }
+});
+
 test("failure queues stay exclusive across restart and explicit requeue preserves pending enrollment", async () => {
   const temp = await temporary();
   let repo = new Repository(temp.dir);

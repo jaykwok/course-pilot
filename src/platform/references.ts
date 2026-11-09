@@ -202,31 +202,14 @@ export async function references(
               );
               if (typeof preview.url !== "string")
                 throw new Error("课件预览地址缺失");
-              const auth = await tab.evaluate(
-                () => {
-                  const c = document.cookie.match(
-                    /(?:^|; )authorization=([^;]+)/,
-                  )?.[1];
-                  if (c) return decodeURIComponent(c);
-                  try {
-                    const t = JSON.parse(
-                      localStorage.getItem("token") || "{}",
-                    ).access_token;
-                    if (t) return `Bearer__${t}`;
-                  } catch {}
-                  const s = localStorage.getItem("saas-token");
-                  return s ? `Bearer__${s}` : "";
-                },
-                undefined,
-                { timeout: 5000, signal: ctx.lease.signal },
-              );
+              const auth = await api.authorization();
               ctx.auth.assert(ctx.lease);
               const file = decodeDocument(
                 await downloadFile(preview.url, auth, ctx.lease.signal),
                 preview.extention || preview.type || ext,
               );
               ctx.auth.assert(ctx.lease);
-              const name = `${filename(info.name || course.businessId)}-${filename(s.name || id)}-${filename(id.slice(0, 8))}.${file.ext}`,
+              const name = `${filename(`${info.name || course.businessId}-${s.name || id}`)}-${checksum(JSON.stringify([course.businessId, id]))}.${file.ext}`,
                 path = join(output, name),
                 tmp = `${path}.${token()}.tmp`;
               try {
@@ -254,7 +237,7 @@ export async function references(
                   `/api/v1/course-study/guide-study/get-guide-study-info?courseId=${course.businessId}&attachmentId=${encodeURIComponent(id)}`,
                 ),
               );
-              const name = `${filename(info.name || course.businessId)}-${filename(id.slice(0, 8))}-导学.json`;
+              const name = `${filename(`${info.name || course.businessId}-导学`)}-${checksum(JSON.stringify([course.businessId, id]))}.json`;
               ctx.auth.assert(ctx.lease);
               await atomicJson(join(output, name), items);
               const markdown = name.replace(/\.json$/, ".md");

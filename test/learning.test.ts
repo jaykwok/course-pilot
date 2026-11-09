@@ -60,40 +60,47 @@ async function fixture() {
             return null;
           },
           async waitForFunction() {},
-          async waitForSelector() {
+          locator() {
             return {
-              async evaluate() {
-                return true;
+              async element() {
+                return {
+                  async evaluate() {
+                    return true;
+                  },
+                };
               },
             };
           },
-          async evaluate(fn: unknown, arg: any) {
+          async evaluate(fn: unknown, arg: any, options: any) {
             if (fn === playbackSnapshot) return structuredClone(playback);
-            if (arg?.url) {
-              if (arg.url.includes("/info/"))
-                return {
-                  status: 200,
-                  value: {
-                    id: task.businessId,
-                    courseChapters: [{ courseChapterSections: [section] }],
-                  },
-                };
-              assert.ok(arg.url.endsWith("/course-section-progress"));
-              reads.push(Date.now());
+            if (typeof arg === "string") return true;
+            if (options?.world === "isolated") return "synthetic-token";
+            return { title: "课程", notices: [], challenge: false };
+          },
+          async fetch(url: string) {
+            if (url.includes("/info/"))
               return {
                 status: 200,
-                value: [
-                  {
-                    courseId: task.businessId,
-                    sectionId: section.id,
-                    resourceId: section.resourceId,
-                    finishStatus: Date.now() >= 5000 ? 2 : 0,
-                  },
-                ],
+                ok: true,
+                body: JSON.stringify({
+                  id: task.businessId,
+                  courseChapters: [{ courseChapterSections: [section] }],
+                }),
               };
-            }
-            if (typeof arg === "string") return true;
-            return { title: "课程", notices: [], challenge: false };
+            assert.ok(url.endsWith("/course-section-progress"));
+            reads.push(Date.now());
+            return {
+              status: 200,
+              ok: true,
+              body: JSON.stringify([
+                {
+                  courseId: task.businessId,
+                  sectionId: section.id,
+                  resourceId: section.resourceId,
+                  finishStatus: Date.now() >= 5000 ? 2 : 0,
+                },
+              ]),
+            };
           },
         };
       },

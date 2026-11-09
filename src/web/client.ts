@@ -622,15 +622,19 @@ function renderAccount(d: Record<string, any>) {
       ? `凭证剩余 ${days ?? "—"} 天`
       : status === "expired"
         ? "凭证已过期"
-        : "待登录";
+        : status === "invalid"
+          ? "凭证已失效"
+          : "待登录";
   $("credential").textContent =
     status === "valid"
       ? `凭证有效，${d.credential.expires_on || "未知日期"}到期（剩余 ${days ?? "—"} 天）`
       : status === "expired"
         ? "登录凭证已过期，请更新登录"
-        : d.pending_owner
-          ? `待办归属：${d.pending_owner}`
-          : "登录后核验账号并保存凭证";
+        : status === "invalid"
+          ? "平台已拒绝当前凭证，请更新登录"
+          : d.pending_owner
+            ? `待办归属：${d.pending_owner}`
+            : "登录后核验账号并保存凭证";
 }
 
 const PHASES: Record<string, { label: string; tone: string; glyph: string }> = {
@@ -680,9 +684,10 @@ function renderHero(snapshot: Snapshot, d: Record<string, any>) {
         : "连接中断，暂时无法确认任务状态；恢复连接后自动更新。";
     else if (phase === "active" && snapshot.control.stop_after_current)
       view = { ...view, label: "本课后停止" };
-  } else if (d.credential?.status === "expired") {
+  } else if (["expired", "invalid"].includes(d.credential?.status)) {
     view = { ...view, tone: "warn", glyph: "i-warning" };
-    title = "登录凭证已过期";
+    title =
+      d.credential.status === "invalid" ? "登录凭证已失效" : "登录凭证已过期";
     status = "请更新登录凭证，再继续学习与考试。本地队列仍可直接管理。";
   } else if (d.credential?.status !== "valid") {
     view = { ...view, tone: "info", glyph: "i-person" };
@@ -1094,6 +1099,15 @@ let models: string[] = [],
   modelsLoaded = false,
   activeModel = -1,
   modelRequest: AbortController | null = null;
+let savedModelBaseURL = "",
+  savedModelKey = false;
+
+function keyPlaceholder() {
+  settingsApiKey.placeholder =
+    savedModelKey && settingsBaseURL.value.trim() === savedModelBaseURL
+      ? "已配置，留空保持不变"
+      : "请填写此接口的 API Key";
+}
 
 function modelAvailability() {
   modelsFetch.disabled =
@@ -1207,10 +1221,11 @@ settingsDialog.addEventListener("cancel", (event) => {
     closeModels();
   }
 });
-settingsBaseURL.oninput =
-  settingsApiKey.oninput =
-  settingsKeyClear.onchange =
-    resetModels;
+settingsBaseURL.oninput = () => {
+  keyPlaceholder();
+  resetModels();
+};
+settingsApiKey.oninput = settingsKeyClear.onchange = resetModels;
 modelsFetch.onclick = async () => {
   if (!settingsBaseURL.reportValidity()) return;
   resetModels();
@@ -1264,15 +1279,13 @@ $("settings-open").onclick = async () => {
     const response = await fetch("/api/settings");
     if (!response.ok) throw new Error("无法读取设置");
     const settings = await response.json();
+    savedModelBaseURL = settings.openai.baseURL;
+    savedModelKey = settings.openai.keyConfigured;
     for (const field of settingsFields) {
       const [group, key] = field.dataset.setting!.split(".");
       field.value = String(settings[group][key]);
-      if (key === "apiKey")
-        field.setAttribute(
-          "placeholder",
-          settings.openai.keyConfigured ? "已配置，留空保持不变" : "未配置",
-        );
     }
+    keyPlaceholder();
     settingsKeyClear.checked = false;
     resetModels();
     $("settings-error").textContent = "";

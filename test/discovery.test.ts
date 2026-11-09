@@ -340,6 +340,7 @@ test("failed native expansion preserves collected courses and waits for input cl
     randomState: 1,
     completedSegments: 0,
     events: 0,
+    dispatched: 0,
     trace: [],
     cleanupErrors: [],
     phase: "done",
@@ -506,15 +507,19 @@ test("large real-shaped catalogs exceed 100 containers while reusing one platfor
               return [];
             },
             async waitForFunction() {},
-            async evaluate(_fn: unknown, arg: any) {
+            async evaluate() {
               if (url === root) return snapshot(url, subjects);
+              return "synthetic-token";
+            },
+            async fetch(requestUrl: string) {
               assert.ok(
-                arg.url.includes("/subject/chapter-progress?courseId="),
+                requestUrl.includes("/subject/chapter-progress?courseId="),
               );
               reads++;
               return {
                 status: 200,
-                value: [
+                ok: true,
+                body: JSON.stringify([
                   {
                     courseChapterSections: [
                       {
@@ -524,7 +529,7 @@ test("large real-shaped catalogs exceed 100 containers while reusing one platfor
                       },
                     ],
                   },
-                ],
+                ]),
               };
             },
           };
@@ -576,10 +581,20 @@ test("topic and case-pool adapters share recursive traversal, aliases, cycles an
                     `<a href="${CASE_POOL}">案例库</a><a href="http://ctexpert.cn/expert-assist-h5/casePool">移动案例库</a>`,
                   ]);
                 if (url === nested) return snapshot(url, [SUBJECT, CASE_POOL]);
+                if (url === SUBJECT) return "synthetic-token";
+                assert.equal(url, CASE_POOL);
+                assert.equal(arg, undefined);
+                return runInNewContext(`(${fn.toString()})()`, {
+                  location: new URL(CASE_POOL),
+                  localStorage: { getItem: () => "synthetic-token" },
+                });
+              },
+              async fetch(path: string, options: any) {
                 if (url === SUBJECT)
                   return {
                     status: 200,
-                    value: [
+                    ok: true,
+                    body: JSON.stringify([
                       {
                         courseChapterSections: [
                           {
@@ -593,45 +608,36 @@ test("topic and case-pool adapters share recursive traversal, aliases, cycles an
                           },
                         ],
                       },
-                    ],
+                    ]),
                   };
-                assert.equal(url, CASE_POOL);
-                assert.equal(arg, undefined);
-                return runInNewContext(`(${fn.toString()})()`, {
-                  AbortSignal,
-                  location: new URL(CASE_POOL),
-                  localStorage: { getItem: () => "synthetic-token" },
-                  fetch: async (path: string, options: any) => {
-                    assert.equal(options.headers.token, "synthetic-token");
-                    if (path.includes("/tag/listTree"))
-                      return {
-                        ok: true,
-                        json: async () => ({
-                          code: 200,
-                          data: [
-                            { name: "案例资源", childrenList: [{ id: "tag" }] },
-                          ],
-                        }),
-                      };
-                    const page = JSON.parse(options.body).pageNum;
-                    pages.push(page);
-                    return {
-                      ok: true,
-                      json: async () => ({
-                        code: incomplete && page === 2 ? 500 : 200,
-                        data: {
-                          total: 2,
-                          records: [
-                            {
-                              id: String(page),
-                              url: page === 1 ? nested : COURSE,
-                            },
-                          ],
+                assert.equal(options.headers.token, "synthetic-token");
+                if (path.includes("/tag/listTree"))
+                  return {
+                    ok: true,
+                    body: {
+                      code: 200,
+                      data: [
+                        { name: "案例资源", childrenList: [{ id: "tag" }] },
+                      ],
+                    },
+                  };
+                const page = JSON.parse(options.body).pageNum;
+                pages.push(page);
+                return {
+                  ok: true,
+                  body: {
+                    code: incomplete && page === 2 ? 500 : 200,
+                    data: {
+                      total: 2,
+                      records: [
+                        {
+                          id: String(page),
+                          url: page === 1 ? nested : COURSE,
                         },
-                      }),
-                    };
+                      ],
+                    },
                   },
-                });
+                };
               },
             };
           },
@@ -696,17 +702,29 @@ test("subject learning refreshes nested activity progress without erasing incomp
               async reload() {
                 reloads++;
               },
-              async evaluate(_fn: unknown, arg: any) {
-                if (!arg?.url) return []; // No unfinished DOM items; refresh server evidence.
-                if (arg.url.includes(entry(child, account).businessId))
+              async evaluate(fn: Function) {
+                return runInNewContext(`(${fn.toString()})()`, {
+                  location: new URL("https://kc.zhixueyun.com"),
+                  document: {
+                    cookie: "authorization=synthetic-token",
+                    querySelectorAll: () => [],
+                  },
+                });
+              },
+              async fetch(requestUrl: string) {
+                if (requestUrl.includes(entry(child, account).businessId))
                   return {
                     status: 200,
-                    value: [{ courseChapterSections: [{ sectionType: 77 }] }],
+                    ok: true,
+                    body: JSON.stringify([
+                      { courseChapterSections: [{ sectionType: 77 }] },
+                    ]),
                   };
                 reads++;
                 return {
                   status: 200,
-                  value: [
+                  ok: true,
+                  body: JSON.stringify([
                     {
                       courseChapterSections: [
                         {
@@ -723,7 +741,7 @@ test("subject learning refreshes nested activity progress without erasing incomp
                         },
                       ],
                     },
-                  ],
+                  ]),
                 };
               },
             };

@@ -425,7 +425,7 @@ export class Application extends EventEmitter {
         return;
       }
       if (kind === "clear_credentials") {
-        await this.auth.forget();
+        await this.auth.forget(scope.signal);
         this.notify("登录信息已清除，任务与资料已保留。");
         return;
       }

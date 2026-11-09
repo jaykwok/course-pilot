@@ -53,23 +53,23 @@ async function fixture(
             return [];
           },
           async waitForFunction() {},
-          async evaluate(
-            _fn: unknown,
-            arg?: { url: string; method: string; body: unknown; extra: any },
-          ) {
-            if (!arg)
-              return {
-                url,
-                values: [paas],
-                title: "专题",
-                text: "",
-                ready: true,
-                status: 200,
-                article: false,
-                busy: false,
-                interactive: false,
-              };
-            const path = new URL(arg.url).pathname;
+          async evaluate(_fn: unknown, code?: unknown) {
+            if (code !== undefined) return undefined;
+            if (url !== root) return "synthetic-token";
+            return {
+              url,
+              values: [paas],
+              title: "专题",
+              text: "",
+              ready: true,
+              status: 200,
+              article: false,
+              busy: false,
+              interactive: false,
+            };
+          },
+          async fetch(requestUrl: string, request: any) {
+            const path = new URL(requestUrl).pathname;
             let value: unknown;
             if (path.endsWith("/registrationProgress"))
               value = {
@@ -98,9 +98,9 @@ async function fixture(
                 ...options.info,
               };
             } else if (path.endsWith("/register")) {
-              assert.equal(arg.method, "POST");
-              assert.deepEqual(arg.body, { classId });
-              assert.equal(arg.extra.permitenable, "false");
+              assert.equal(request.method, "POST");
+              assert.deepEqual(JSON.parse(request.body), { classId });
+              assert.equal(request.headers.permitenable, "false");
               posts++;
               status = options.after ?? 5;
               if (options.lostResponse) throw new Error("response lost");
@@ -112,8 +112,17 @@ async function fixture(
                 "chapters must only be read after verified enrollment",
               );
               chapterReads++;
-              if (path.endsWith("/chapter-activity-list") && options.activities)
-                return options.activities(new URL(arg.url));
+              if (
+                path.endsWith("/chapter-activity-list") &&
+                options.activities
+              ) {
+                const result = options.activities(new URL(requestUrl));
+                return {
+                  status: result.status,
+                  ok: result.status === 200,
+                  body: JSON.stringify(result.value),
+                };
+              }
               value = path.endsWith("/chapter")
                 ? options.chapters || [
                     { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
@@ -130,7 +139,7 @@ async function fixture(
                     recordCount: 1,
                   };
             }
-            return { status: 200, value };
+            return { status: 200, ok: true, body: JSON.stringify(value) };
           },
         };
       },

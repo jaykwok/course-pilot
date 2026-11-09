@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { WebSocket } from "ws";
 import { WebServer } from "../src/web/server.ts";
-import { token } from "../src/utils.ts";
+import { token, until, sleep } from "../src/utils.ts";
 import { application, COURSE } from "./helpers.ts";
 import { IMPORT_INBOX } from "../src/storage/transfer.ts";
 import { defaults, readSettings, saveSettings } from "../src/config.ts";
@@ -146,6 +146,47 @@ test("model discovery reports empty lists and provider errors without exposing k
     await f.cleanup();
   }
 });
+test("service shutdown cancels in-flight model discovery without waiting for the provider", async () => {
+  const f = await fixture(),
+    provider = await modelService();
+  let release = () => {},
+    closing: Promise<void> | undefined;
+  provider.state.hold = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  try {
+    const writer = await f.connect();
+    const requestEnded = f
+      .post(
+        "/api/models",
+        {
+          baseURL: provider.baseURL,
+          apiKey: "draft-secret",
+          clearKey: false,
+        },
+        writer.snapshot.generation,
+      )
+      .then(
+        () => false,
+        () => true,
+      );
+    await until(async () => provider.requests.length === 1, 3000);
+    closing = f.cleanup();
+    assert.equal(
+      await Promise.race([
+        closing.then(() => true),
+        sleep(3000).then(() => false),
+      ]),
+      true,
+    );
+    assert.equal(await requestEnded, true);
+  } finally {
+    release();
+    await (closing || f.cleanup());
+    await provider.close();
+  }
+});
+
 test("HTTP bootstrap single-use, origin/CSRF boundaries and observer windows", async () => {
   const f = await fixture();
   try {

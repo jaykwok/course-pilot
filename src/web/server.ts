@@ -357,9 +357,10 @@ export class WebServer {
     if (this.timer) clearInterval(this.timer);
     for (const ws of this.sockets.clients) ws.terminate();
     this.sockets.close();
-    this.server.closeIdleConnections();
-    await new Promise<void>((resolve, reject) =>
-      this.server.close((e) => (e ? reject(e) : resolve())),
-    );
+    await new Promise<void>((resolve, reject) => {
+      this.server.close((e) => (e ? reject(e) : resolve()));
+      // Closing the service also cancels in-flight model discovery via res.close.
+      this.server.closeAllConnections();
+    });
   }
 }

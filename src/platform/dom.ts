@@ -102,7 +102,7 @@ export async function startRegisteredCourse(
     await waitForOverlayExit(tab, ".register-mask-layer", signal, guard);
   return clicked;
 }
-/** Native input for main-frame player controls, with a fresh hit check before press. */
+/** Player actions stay in the main frame; nodriver owns scrolling and hit checks. */
 export async function clickPlayerControl(
   tab: Tab,
   element: BrowserElement,
@@ -113,50 +113,10 @@ export async function clickPlayerControl(
   guard();
   if (element.frame !== tab.mainFrame)
     throw new ActionabilityError("播放按钮不在主页面");
-  await element.scrollIntoView({ timeout: 5000, signal });
-  const point = await element.evaluate((e) => {
-    const r = e.getBoundingClientRect();
-    return {
-      x: (Math.max(0, r.left) + Math.min(innerWidth, r.right)) / 2,
-      y: (Math.max(0, r.top) + Math.min(innerHeight, r.bottom)) / 2,
-    };
-  });
-  const verify = async () => {
-    guard();
-    signal.throwIfAborted();
-    const valid = await element.evaluate((e, { x, y }) => {
-      const r = e.getBoundingClientRect(),
-        style = getComputedStyle(e);
-      const hit = document.elementFromPoint(x, y);
-      return (
-        e.isConnected &&
-        r.width > 0 &&
-        r.height > 0 &&
-        x >= 0 &&
-        y >= 0 &&
-        x < innerWidth &&
-        y < innerHeight &&
-        x >= r.left &&
-        x < r.right &&
-        y >= r.top &&
-        y < r.bottom &&
-        style.visibility !== "hidden" &&
-        style.display !== "none" &&
-        !e.matches(":disabled") &&
-        e.getAttribute("aria-disabled") !== "true" &&
-        !!hit &&
-        (hit === e || e.contains(hit))
-      );
-    }, point);
-    if (!valid)
-      throw new ActionabilityError("播放按钮已移动或被遮挡，未执行点击");
-  };
-  await verify();
-  await tab.mouse.click(point.x, point.y, {
+  await element.click({
     timeout: 5000,
     signal,
     guard,
-    beforePress: verify,
   });
 }
 export async function clickText(

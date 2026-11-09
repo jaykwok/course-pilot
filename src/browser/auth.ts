@@ -12,7 +12,6 @@ import {
 import { atomicJson } from "../storage/files.ts";
 import { AuthenticationError, digest, until } from "../utils.ts";
 import type { BrowserRuntime, TabScope } from "./runtime.ts";
-import { navigateDocument } from "./navigation.ts";
 import { waitForLoginReturn } from "./login.ts";
 import { waitForCasePoolSession } from "./case-pool.ts";
 
@@ -36,6 +35,7 @@ export class Authentication {
   private current?: Credential;
   private fingerprint = "";
   private verified = false;
+  private rejectedFingerprint = "";
   constructor(runtime: BrowserRuntime, directory: string) {
     this.runtime = runtime;
     this.path = join(directory, "credentials.json");
@@ -76,25 +76,32 @@ export class Authentication {
     return {
       account: c?.name || c?.account || "",
       credential: {
-        status: c ? (expires > Date.now() ? "valid" : "expired") : "missing",
+        status: !c
+          ? "missing"
+          : this.rejectedFingerprint === this.fileFingerprint()
+            ? "invalid"
+            : expires > Date.now()
+              ? "valid"
+              : "expired",
         expires_on: c?.expires.slice(0, 10),
         days_left: Math.max(0, Math.ceil((expires - Date.now()) / 86400000)),
       },
     };
   }
-  async clear() {
+  async clear(signal?: AbortSignal) {
     this.generation++;
     this.verified = false;
     this.current = undefined;
     this.fingerprint = "";
-    await this.runtime.clearPlatform();
+    await this.runtime.clearPlatform(signal);
   }
   invalidate() {
     this.generation++;
     this.verified = false;
+    this.rejectedFingerprint = this.fileFingerprint();
   }
-  async forget() {
-    await this.clear();
+  async forget(signal?: AbortSignal) {
+    await this.clear(signal);
     await atomicJson(this.path, { version: 2, cookies: [] });
   }
   async profile(
@@ -104,7 +111,11 @@ export class Authentication {
   ): Promise<{ account: string; name: string }> {
     const tab = existing || (await scope.open());
     try {
-      await navigateDocument(tab, `${CENTER}/PC/home`, scope.signal, timeout);
+      await tab.goto(`${CENTER}/PC/home`, {
+        signal: scope.signal,
+        timeout,
+        waitUntil: "domcontentloaded",
+      });
       await tab.waitForFunction(
         () =>
           location.origin === "https://center.mylearning.cn" &&
@@ -112,40 +123,50 @@ export class Authentication {
         undefined,
         { timeout, signal: scope.signal },
       );
-      const result = await tab.evaluate(
-        async () => {
+      const token = await tab.evaluate(
+        () => {
           if (location.origin !== "https://center.mylearning.cn")
             throw new Error("认证页面变化");
           const t = localStorage.getItem("token");
           if (!t) throw new Error("未登录");
-          const r = await fetch("/api/personal/user/info", {
-            headers: { "x-token": t },
-            redirect: "error",
-            signal: AbortSignal.timeout(15000),
-          });
-          if (!r.ok) throw new Error("账号核验失败");
-          const j = await r.json();
-          if (
-            j.code !== 0 ||
-            !["string", "number"].includes(typeof j.data?.id) ||
-            !String(j.data.id).trim()
-          )
-            throw new Error("账号标识缺失");
-          return {
-            account: `center:${j.data.id}`,
-            name: String(j.data.name || ""),
-          };
+          return t;
         },
         undefined,
-        { timeout: 20000, signal: scope.signal },
+        { timeout: 5000, signal: scope.signal, world: "isolated" },
       );
-      return result;
+      const response = await tab.fetch<string>(
+        `${CENTER}/api/personal/user/info`,
+        {
+          headers: { "x-token": token },
+          mode: "same-origin",
+          redirect: "error",
+          timeout: 15000,
+          signal: scope.signal,
+          responseType: "text",
+        },
+      );
+      if (response.status === 401 || response.status === 403) {
+        this.invalidate();
+        throw new AuthenticationError("平台账号核验被拒绝，请更新登录凭证");
+      }
+      if (!response.ok) throw new Error("账号核验失败");
+      const j = JSON.parse(response.body);
+      if (
+        j.code !== 0 ||
+        !["string", "number"].includes(typeof j.data?.id) ||
+        !String(j.data.id).trim()
+      )
+        throw new Error("账号标识缺失");
+      return {
+        account: `center:${j.data.id}`,
+        name: String(j.data.name || ""),
+      };
     } finally {
       if (!existing) await tab.close();
     }
   }
   async login(scope: TabScope, report: (text: string) => void) {
-    await this.clear();
+    await this.clear(scope.signal);
     const tab = await scope.open(HOME);
     await tab.bringToFront();
     report("请在浏览器平台页完成登录，登录成功后将自动核验账号");
@@ -167,6 +188,7 @@ export class Authentication {
     this.current = c;
     this.fingerprint = this.fileFingerprint();
     this.verified = true;
+    this.rejectedFingerprint = "";
     await tab.close();
     report(`已登录 ${profile.name || profile.account}`);
   }
@@ -180,7 +202,7 @@ export class Authentication {
     )
       throw new AuthenticationError("请先登录或更新凭证");
     if (!this.verified || fingerprint !== this.fingerprint) {
-      await this.clear();
+      await this.clear(scope.signal);
       await this.runtime.context.setCookies(
         c.cookies.filter((c) =>
           platformHost(
@@ -198,13 +220,16 @@ export class Authentication {
       } finally {
         await home.close();
       }
-      if (profile.account !== c.account)
+      if (profile.account !== c.account) {
+        this.invalidate();
         throw new AuthenticationError("浏览器账号与凭证不一致，请重新登录");
+      }
       if (this.fileFingerprint() !== fingerprint)
         throw new AuthenticationError("凭证在核验过程中发生变化，请重试");
       this.current = c;
       this.fingerprint = fingerprint;
       this.verified = true;
+      this.rejectedFingerprint = "";
     }
     return {
       account: accountId(c.account),
@@ -233,7 +258,12 @@ export class Authentication {
     this.assert(lease);
     const wanted = entry(url, lease.account);
     const tab = existing || (await scope.open(wanted.url));
-    if (existing) await navigateDocument(tab, wanted.url, lease.signal);
+    if (existing)
+      await tab.goto(wanted.url, {
+        signal: lease.signal,
+        timeout: 30000,
+        waitUntil: "domcontentloaded",
+      });
     if (isCasePoolUrl(wanted.url)) {
       try {
         await waitForCasePoolSession(tab, lease.signal, () =>
@@ -287,7 +317,11 @@ export class Authentication {
           if (accountId(profile.account) !== lease.account)
             throw new AuthenticationError("认证回跳账号不一致");
           this.assert(lease);
-          await navigateDocument(tab, url, lease.signal);
+          await tab.goto(url, {
+            signal: lease.signal,
+            timeout: 30000,
+            waitUntil: "domcontentloaded",
+          });
           reopened = true;
         }
         return false;

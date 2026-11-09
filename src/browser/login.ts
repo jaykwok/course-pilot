@@ -95,9 +95,11 @@ export async function applyLoginPreferences(tab: Tab, signal: AbortSignal) {
         error instanceof TimeoutError ||
         (error instanceof ProtocolError &&
           ((error.method === "DOM.scrollIntoViewIfNeeded" &&
-            error.message.includes("Node does not have a layout object")) ||
+            error.protocolMessage.includes(
+              "Node does not have a layout object",
+            )) ||
             /context.*(?:destroyed|not found)|cannot find context|no frame with given id/i.test(
-              error.message,
+              error.protocolMessage,
             )))
       )
         continue;

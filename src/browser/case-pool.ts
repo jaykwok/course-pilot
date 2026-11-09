@@ -111,7 +111,7 @@ export async function waitForCasePoolSession(
     } catch (error) {
       signal.throwIfAborted();
       if (error instanceof InputActionError) {
-        if (error.report.events > 0) clicked = true;
+        if (error.report.dispatched > 0) clicked = true;
         if ((await error.cleanup).status !== "completed") throw error;
         error = error.cause;
       }
@@ -120,7 +120,7 @@ export async function waitForCasePoolSession(
         error instanceof StaleElementError ||
         (error instanceof ProtocolError &&
           /context.*(?:destroyed|not found)|cannot find context|no frame with given id/i.test(
-            error.message,
+            error.protocolMessage,
           ))
       )
         continue;

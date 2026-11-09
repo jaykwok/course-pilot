@@ -29,6 +29,16 @@ test("settings persist in one file; secret is write-only in projection and blank
     await saveSettings(path, prepareSettings(shown, path));
     assert.equal(readSettings(path).openai.apiKey, s.openai.apiKey);
     assert.equal(readSettings(path).openai.model, "model-b");
+    const changed = {
+      ...shown,
+      openai: { ...shown.openai, baseURL: "https://new-provider.test/v1" },
+    };
+    assert.equal(prepareSettings(changed, path).openai.apiKey, "");
+    changed.openai.apiKey = "new-provider-key";
+    assert.equal(
+      prepareSettings(changed, path).openai.apiKey,
+      "new-provider-key",
+    );
     await saveSettings(path, prepareSettings(shown, path, true));
     assert.equal(publicSettings(path).openai.keyConfigured, false);
     assert.throws(() =>

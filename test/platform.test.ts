@@ -4,10 +4,13 @@ import {
   examState,
   entryProblem,
   newSubmission,
+  sameAnswers,
 } from "../src/platform/exam.ts";
 import { sectionStates, activate } from "../src/platform/learning.ts";
 import {
   InputActionError,
+  Locator,
+  TimeoutError,
   StaleElementError,
   type Tab,
   type InputReport,
@@ -24,42 +27,47 @@ import { COURSE, EXAM } from "./helpers.ts";
 import { accessProblem, clickPlayerControl } from "../src/platform/dom.ts";
 import type { Element as BrowserElement } from "nodriver-ts";
 
-test("native player input verifies visibility and checks the target again immediately before press", async () => {
-  for (const checks of [[true, true], [false], [true, false]]) {
-    let pressed = false,
-      evaluations = 0;
+test("answer verification preserves ordering answers and treats multiple choice as a set", () => {
+  assert.equal(
+    sameAnswers("ordering", ["B", "A", "C"], ["A", "B", "C"]),
+    false,
+  );
+  assert.equal(sameAnswers("ordering", ["B", "A", "C"], ["B", "A", "C"]), true);
+  const actual = ["C", "A"],
+    expected = ["A", "C"];
+  assert.equal(sameAnswers("multiple", actual, expected), true);
+  assert.deepEqual(actual, ["C", "A"]);
+  assert.deepEqual(expected, ["A", "C"]);
+});
+
+test("player input uses the library action guard and refuses other frames", async () => {
+  for (const state of ["ready", "other-frame", "expired"]) {
+    let pressed = false;
     const frame = {};
     const element = {
-      frame,
-      async scrollIntoView() {},
-      async evaluate() {
-        return ++evaluations === 1
-          ? { x: 100, y: 150 }
-          : checks[evaluations - 2];
+      frame: state === "other-frame" ? {} : frame,
+      async click(options: any) {
+        assert.equal(options.timeout, 5000);
+        await options.guard();
+        pressed = true;
       },
     } as unknown as BrowserElement;
     const tab = {
       mainFrame: frame,
-      mouse: {
-        async click(x: number, y: number, options: any) {
-          assert.equal(x, 100);
-          assert.equal(y, 150);
-          await options.beforePress();
-          pressed = true;
-        },
-      },
     } as unknown as Tab;
     const result = clickPlayerControl(
       tab,
       element,
       new AbortController().signal,
-      () => {},
+      () => {
+        if (state === "expired") throw new Error("凭证已变化");
+      },
     );
-    if (checks.every(Boolean)) {
+    if (state === "ready") {
       await result;
       assert.equal(pressed, true);
     } else {
-      await assert.rejects(result, /移动或被遮挡/);
+      await assert.rejects(result, /主页面|凭证已变化/);
       assert.equal(pressed, false);
     }
   }
@@ -76,7 +84,8 @@ test("chapter activation reacquires replaced rows but never replays partially di
       seed: 1,
       randomState: 1,
       completedSegments: 0,
-      events: dispatched,
+      events: 1,
+      dispatched,
       trace: [],
       cleanupErrors: [],
       phase: "done",
@@ -87,11 +96,16 @@ test("chapter activation reacquires replaced rows but never replays partially di
       new StaleElementError("Element was removed from its document"),
     );
     const tab = {
-      async evaluate() {
-        return { challenge: false, title: "课程", notices: [] };
+      async evaluate(_fn: unknown, arg: unknown) {
+        return typeof arg === "string"
+          ? false
+          : { challenge: false, title: "课程", notices: [] };
       },
       async queryAll() {
         return [];
+      },
+      locator(selector: string) {
+        return new Locator(() => tab as any, selector);
       },
       async waitForSelector() {
         lookups++;
@@ -134,6 +148,12 @@ test("chapter activation reacquires replaced rows but never replays partially di
 
 test("already active chapters are not clicked again during automatic startup", async () => {
   const tab = {
+    async evaluate() {
+      return true;
+    },
+    locator(selector: string) {
+      return new Locator(() => tab as any, selector);
+    },
     async queryAll() {
       return [];
     },
@@ -156,6 +176,45 @@ test("already active chapters are not clicked again during automatic startup", a
     await activate(tab, { id: "s", resourceId: "r", sectionType: 6 }, ctx),
     'dl.chapter-list-box[id$="s"]',
   );
+});
+
+test("chapter activation never replays a click when the platform does not confirm focus", async () => {
+  let clicks = 0;
+  const tab = {
+    async queryAll() {
+      return [];
+    },
+    async evaluate(_fn: unknown, arg: unknown) {
+      return typeof arg === "string"
+        ? false
+        : { challenge: false, title: "课程", notices: [] };
+    },
+    locator(selector: string) {
+      return new Locator(() => tab as any, selector);
+    },
+    async waitForSelector() {
+      return {
+        async evaluate() {
+          return false;
+        },
+        async click() {
+          clicks++;
+        },
+      };
+    },
+    async waitForFunction() {
+      throw new TimeoutError("focus not confirmed");
+    },
+  } as unknown as Tab;
+  const ctx = {
+    auth: { assert() {} },
+    lease: { signal: new AbortController().signal },
+  } as unknown as DiscoveryContext;
+  await assert.rejects(
+    activate(tab, { id: "s", resourceId: "r", sectionType: 6 }, ctx),
+    /focus not confirmed/,
+  );
+  assert.equal(clicks, 1);
 });
 
 test("access detection distinguishes business text from explicit verification and denial notices", () => {

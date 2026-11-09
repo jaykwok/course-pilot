@@ -186,7 +186,32 @@ export async function modelChecks(page: Tab, settingsPath: string) {
     await waitModels();
     assert.deepEqual(await options(), []);
     await page.keyboard.press("Escape");
-    await (await page.query("#settings-close"))!.click();
+    await (await page.query("#settings-base-url"))!.fill(
+      `${provider.baseURL}/other`,
+    );
+    assert.equal(
+      await page.evaluate(
+        () =>
+          (document.getElementById("settings-api-key") as HTMLInputElement)
+            .placeholder,
+      ),
+      "请填写此接口的 API Key",
+    );
+    await (await page.query("#settings-save"))!.click();
+    await page.waitForFunction(
+      () =>
+        !(document.getElementById("settings-dialog") as HTMLDialogElement)
+          .open &&
+        !(document.getElementById("settings-open") as HTMLButtonElement)
+          .disabled,
+      undefined,
+      { timeout: 5000 },
+    );
+    assert.equal(
+      readSettings(settingsPath).openai.apiKey,
+      "",
+      "changing the provider must not reuse another provider's saved key",
+    );
   } finally {
     release();
     await provider.close();

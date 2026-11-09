@@ -22,6 +22,7 @@ import {
   type DiscoveryContext,
 } from "../../src/platform/discovery.ts";
 import { playbackChecks } from "./live-checks.ts";
+import { activate } from "../../src/platform/learning.ts";
 
 /** Reuses the caller's Browser; all pages here are synthetic and local. */
 export async function platformChecks(runtime: BrowserRuntime) {
@@ -97,26 +98,46 @@ export async function platformChecks(runtime: BrowserRuntime) {
     );
     await inspectAccess(tab, signal);
     await playbackChecks(tab);
-    await tab.setContent(
-      `<html><body><div class="question-type-item" data-dynamic-key="q1"><span class="o-score">多选题</span><div class="stem-content-main">选择一和三</div><dl class="preview-list"><dd><label><input type="checkbox"><span class="option-num">A.</span><span class="answer-options">一</span></label></dd><dd><label><input type="checkbox"><span class="option-num">B.</span><span class="answer-options">二</span></label></dd><dd><label><input type="checkbox"><span class="option-num">C.</span><span class="answer-options">三</span></label></dd></dl></div></body></html>`,
-    );
-    const parsed = await extractQuestions(tab, signal);
-    assert.equal(parsed.questions.length, 1);
-    assert.equal(parsed.questions[0].type, "multiple");
     const ctx = {
       lease: { signal },
       auth: { assert: () => signal.throwIfAborted() },
     } as unknown as DiscoveryContext;
-    assert.equal(
-      await applyAnswers(tab, parsed.questions[0], ["A", "C"], ctx),
-      true,
-    );
-    assert.deepEqual(await selectedAnswers(tab, parsed.questions[0], signal), [
-      "A",
-      "C",
-    ]);
+    for (const labeled of [true, false]) {
+      const options = ["一", "二", "三"]
+        .map((text, index) => {
+          const content = `<input type="checkbox" ${index === 1 ? "checked" : ""} hidden><span class="option-num">${"ABC"[index]}.</span><span class="answer-options">${text}</span>`;
+          return labeled
+            ? `<dd><label>${content}</label></dd>`
+            : `<dd onclick="const input=this.querySelector('input');input.checked=!input.checked">${content}</dd>`;
+        })
+        .join("");
+      await tab.setContent(
+        `<html><body><div class="question-type-item" data-dynamic-key="q1"><span class="o-score">多选题</span><div class="stem-content-main">选择一和三</div><dl class="preview-list">${options}</dl></div></body></html>`,
+      );
+      const parsed = await extractQuestions(tab, signal);
+      assert.equal(parsed.questions.length, 1);
+      assert.equal(parsed.questions[0].type, "multiple");
+      assert.equal(
+        await applyAnswers(tab, parsed.questions[0], ["A", "C"], ctx),
+        true,
+      );
+      assert.deepEqual(
+        await selectedAnswers(tab, parsed.questions[0], signal),
+        ["A", "C"],
+      );
+    }
     assert.equal(tab.inputBehavior.policy.mode, "human");
     assert.ok(tab.inputBehavior.lastReport?.events);
+    await tab.setContent(
+      '<dl class="chapter-list-box" id="chapter-section"><dt class="section-item-wrapper" onclick="document.body.dataset.clicks=String(Number(document.body.dataset.clicks||0)+1);this.parentElement.classList.add(\'focus\')">开始章节</dt></dl>',
+    );
+    for (let i = 0; i < 2; i++)
+      await activate(
+        tab,
+        { id: "section", resourceId: "resource", sectionType: 6 },
+        ctx,
+      );
+    assert.equal(await tab.evaluate(() => document.body.dataset.clicks), "1");
     await tab.setContent(
       '<title>Player fixture</title><div style="height:1200px"></div><button id="play" onclick="this.dataset.trusted=String(event.isTrusted)">播放</button>',
     );

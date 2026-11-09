@@ -1,37 +1,34 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { writeFile, readFile } from "node:fs/promises";
+import { writeFile, readFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
-  createProfile,
-  validateProfile,
-  removeProfile,
   PASSWORD_TIME,
   prepareProjectProfile,
 } from "../src/browser/profile.ts";
 import { application, temporary } from "./helpers.ts";
 import { atomicJson } from "../src/storage/files.ts";
 import { accountId } from "../src/domain/identity.ts";
-import { Browser, ProtocolError } from "nodriver-ts";
+import { Browser, ClearSiteDataError } from "nodriver-ts";
 import { BrowserRuntime } from "../src/browser/runtime.ts";
 import { Logger } from "../src/log.ts";
 import type { Protocol } from "devtools-protocol";
 import { NO_REPLY } from "nodriver-ts/testing";
-import { navigateDocument } from "../src/browser/navigation.ts";
 
 test("project profile preserves existing state, reapplies local-only settings and refuses personal profiles", async () => {
   const temp = await temporary();
   try {
     const dir = join(temp.dir, "browser-profile");
-    await prepareProjectProfile(dir);
+    await mkdir(dir);
+    await writeFile(join(dir, ".nodriver.lock"), "synthetic library lock");
+    await prepareProjectProfile(dir, { empty: true, temporary: false });
     const prefsPath = join(dir, "Default", "Preferences");
     const prefs = JSON.parse(await readFile(prefsPath, "utf8"));
     prefs.custom = { firstRunDismissed: true };
     prefs.signin.allowed = true;
     await atomicJson(prefsPath, prefs);
     await writeFile(join(dir, "Default", "Cookies"), "synthetic cookie store");
-    await prepareProjectProfile(dir);
-    await validateProfile(dir);
+    await prepareProjectProfile(dir, { empty: false, temporary: false });
     const restored = JSON.parse(await readFile(prefsPath, "utf8"));
     assert.deepEqual(restored.custom, { firstRunDismissed: true });
     assert.equal(restored.signin.allowed, false);
@@ -43,7 +40,10 @@ test("project profile preserves existing state, reapplies local-only settings an
       personal: true,
     });
     await assert.rejects(
-      prepareProjectProfile(join(temp.dir, "personal")),
+      prepareProjectProfile(join(temp.dir, "personal"), {
+        empty: false,
+        temporary: false,
+      }),
       /不属于此项目/,
     );
     assert.deepEqual(
@@ -67,6 +67,8 @@ test("persistent browser launch stays visible, disables extensions and retains i
       assert.ok(options.args.includes("--disable-extensions"));
       assert.ok(options.args.includes("--disable-sync"));
       assert.ok(!options.args.includes("--no-sandbox"));
+      assert.deepEqual(options.inputPolicy, { mode: "human" });
+      await options.prepareProfile(dir, { empty: true, temporary: false });
       return f.browser;
     });
     const runtime = await BrowserRuntime.launch(
@@ -75,17 +77,23 @@ test("persistent browser launch stays visible, disables extensions and retains i
       dir,
     );
     await runtime.close();
-    await validateProfile(dir);
+    const local = JSON.parse(await readFile(join(dir, "Local State"), "utf8"));
+    assert.equal(local.password_manager.os_password_blank, false);
+    assert.equal(
+      local.password_manager.os_password_last_changed,
+      PASSWORD_TIME,
+    );
     assert.ok(await readFile(join(dir, "course-afk-profile.json"), "utf8"));
   } finally {
     await f.close();
   }
 });
 
-test("navigation follows rapid SSO replacements and retries only destroyed document contexts", async () => {
+test("task navigation follows rapid SSO replacements without replaying the navigation", async () => {
   const f = await application();
   try {
-    const tab = await f.runtime.context.newTab();
+    const tab = f.browser.tabs[0];
+    const scope = f.runtime.scope(new AbortController().signal);
     const frame = (loaderId: string, url: string) =>
       ({
         id: tab.mainFrame.id,
@@ -110,41 +118,29 @@ test("navigation follows rapid SSO replacements and retries only destroyed docum
           { frame: frame(loader, target), type: "Navigation" },
           command.sessionId,
         );
+      f.chrome.emit(
+        "Page.lifecycleEvent",
+        {
+          frameId: tab.mainFrame.id,
+          loaderId: "final",
+          name: "DOMContentLoaded",
+          timestamp: 1,
+        },
+        command.sessionId,
+      );
       return { frameId: tab.mainFrame.id, loaderId: "sso" };
     });
-    f.chrome.handle("Page.createIsolatedWorld", () => ({
-      executionContextId: 7,
-    }));
-    let evaluations = 0;
-    f.chrome.handle("Runtime.callFunctionOn", () => {
-      if (++evaluations === 1)
-        throw new ProtocolError(
-          "Runtime.callFunctionOn",
-          -32000,
-          "Execution context was destroyed",
-        );
-      return { result: { type: "boolean", value: true } };
-    });
-    await navigateDocument(
+    assert.equal(
+      await scope.open("https://www.mylearning.cn/login", 1500),
       tab,
-      "https://www.mylearning.cn/login",
-      new AbortController().signal,
-      1500,
     );
     assert.equal(tab.url, "https://center.mylearning.cn/PC/home");
-    assert.equal(evaluations, 2);
-    f.chrome.handle("Runtime.callFunctionOn", () => {
-      throw new ProtocolError("Runtime.callFunctionOn", -32601, "unsupported");
-    });
-    await assert.rejects(
-      navigateDocument(
-        tab,
-        "https://www.mylearning.cn/login",
-        new AbortController().signal,
-        1500,
-      ),
-      /unsupported/,
+    assert.equal(
+      f.chrome.commands.filter((command) => command.method === "Page.navigate")
+        .length,
+      1,
     );
+    await scope.close();
     f.chrome.assertDone();
   } finally {
     await f.close();
@@ -162,13 +158,19 @@ test("navigation timeouts, cancellation and failed requests close owned tabs wit
       scope.open("https://www.mylearning.cn/", 100),
       /timed out|timeout/i,
     );
-    assert.equal(scope.tabs.size, 0);
+    await scope.close();
+    assert.equal(scope.tabs.length, 0);
+    const cancelled = f.runtime.scope(abort.signal);
     f.chrome.handle("Page.navigate", () => {
       abort.abort(new Error("cancelled"));
       return NO_REPLY;
     });
-    await assert.rejects(scope.open("https://www.mylearning.cn/"), /cancelled/);
-    assert.equal(scope.tabs.size, 0);
+    await assert.rejects(
+      cancelled.open("https://www.mylearning.cn/"),
+      /cancelled/,
+    );
+    await cancelled.close();
+    assert.equal(cancelled.tabs.length, 0);
     const next = f.runtime.scope(new AbortController().signal);
     f.chrome.handle("Page.navigate", () => ({
       frameId: "unused",
@@ -178,7 +180,8 @@ test("navigation timeouts, cancellation and failed requests close owned tabs wit
       next.open("https://www.mylearning.cn/"),
       /ERR_NAME_NOT_RESOLVED/,
     );
-    assert.equal(next.tabs.size, 0);
+    await next.close();
+    assert.equal(next.tabs.length, 0);
     assert.equal(admin.closed, false);
     await next.close();
     f.chrome.assertDone();
@@ -187,22 +190,25 @@ test("navigation timeouts, cancellation and failed requests close owned tabs wit
   }
 });
 
-test("profile seeds password probe result and timestamp, fails closed on corruption", async () => {
-  const dir = await createProfile();
+test("temporary profile initialization refuses corrupt JSON instead of replacing it", async () => {
+  const temp = await temporary();
+  const dir = temp.dir;
   try {
-    await validateProfile(dir);
+    await prepareProjectProfile(dir, { empty: true, temporary: true });
     const local = JSON.parse(await readFile(join(dir, "Local State"), "utf8"));
     assert.equal(local.password_manager.os_password_blank, false);
     assert.equal(
       local.password_manager.os_password_last_changed,
       PASSWORD_TIME,
     );
-    delete local.password_manager.os_password_last_changed;
-    await writeFile(join(dir, "Local State"), JSON.stringify(local));
-    await assert.rejects(validateProfile(dir), /阻止启动/);
-    await assert.rejects(removeProfile(process.cwd()), /拒绝清理/);
+    await writeFile(join(dir, "Local State"), "{invalid");
+    await assert.rejects(
+      prepareProjectProfile(dir, { empty: false, temporary: true }),
+      /not valid JSON/,
+    );
+    assert.equal(await readFile(join(dir, "Local State"), "utf8"), "{invalid");
   } finally {
-    await removeProfile(dir);
+    await temp.close();
   }
 });
 test("protocol tabs share one context; scope cleanup preserves management and review tabs", async () => {
@@ -252,12 +258,87 @@ test("abort closes only the owned working tabs", async () => {
     await f.close();
   }
 });
+
+test("borrowed startup and review tabs survive while this round's popups close", async () => {
+  const f = await application();
+  try {
+    const scope = f.runtime.scope(new AbortController().signal);
+    const startup = await scope.open();
+    const openingReview = startup.waitForPopup({ timeout: 1000 });
+    f.chrome.addPage({ openerId: startup.id });
+    const review = await openingReview;
+    scope.retain(review);
+    const openingPopup = review.waitForPopup({ timeout: 1000 });
+    f.chrome.addPage({ openerId: review.id });
+    const popup = await openingPopup;
+    assert.ok(scope.tabs.includes(startup));
+    assert.ok(scope.tabs.includes(review));
+    assert.ok(scope.tabs.includes(popup));
+    await scope.close();
+    assert.equal(startup.closed, false);
+    assert.equal(review.closed, false);
+    assert.equal(popup.closed, true);
+    const next = f.runtime.scope(new AbortController().signal);
+    assert.equal(await next.open(), startup);
+    await next.close();
+    f.chrome.assertDone();
+  } finally {
+    await f.close();
+  }
+});
+
+test("cancellation closes a tab even when creation finishes after the task stops", async () => {
+  const f = await application();
+  const release = Promise.withResolvers<void>();
+  try {
+    f.runtime.management = f.runtime.takeStartupTab();
+    const abort = new AbortController();
+    const scope = f.runtime.scope(abort.signal);
+    const entered = Promise.withResolvers<void>();
+    let target = "";
+    f.chrome.replyOnce("Target.createTarget", async () => {
+      entered.resolve();
+      await release.promise;
+      target = f.chrome.addPage();
+      return { targetId: target };
+    });
+    const reason = new Error("cancelled by the user");
+    const rejected = assert.rejects(scope.open(), (error) => error === reason);
+    await entered.promise;
+    abort.abort(reason);
+    await rejected;
+    release.resolve();
+    await scope.close();
+    assert.ok(target);
+    assert.equal(
+      f.browser.pageTargets.some((page) => page.targetId === target),
+      false,
+    );
+    assert.equal(f.runtime.management!.closed, false);
+    f.chrome.assertDone();
+  } finally {
+    release.resolve();
+    await f.close();
+  }
+});
 test("session clearing targets a page CDP session and preserves the management page", async () => {
   const f = await application();
   try {
     const admin = await f.runtime.context.newTab();
     f.runtime.management = admin;
     f.chrome.handle("Storage.getCookies", () => ({ cookies: [] }));
+    f.chrome.handle("Page.getNavigationHistory", () => ({
+      currentIndex: 1,
+      entries: [
+        {
+          id: 1,
+          url: "https://kc.zhixueyun.com/",
+          userTypedURL: "",
+          title: "old platform page",
+          transitionType: "typed",
+        },
+      ],
+    }));
     const origins: string[] = [];
     f.chrome.handle("Storage.clearDataForOrigin", (params, command) => {
       assert.equal(command.sessionId, admin.cdp.id);
@@ -270,6 +351,38 @@ test("session clearing targets a page CDP session and preserves the management p
     assert.ok(origins.includes("https://sso.example.test"));
     assert.ok(origins.includes("https://www.ctexpert.cn"));
     assert.ok(origins.includes("https://ctexpert.cn"));
+    f.chrome.assertDone();
+  } finally {
+    await f.close();
+  }
+});
+
+test("cancelled platform clearing retains the completed origins and original cause", async () => {
+  const f = await application();
+  try {
+    const admin = (f.runtime.management = f.runtime.takeStartupTab());
+    const abort = new AbortController();
+    const reason = new Error("cancelled platform cleanup");
+    const cleared: string[] = [];
+    f.chrome.handle("Storage.getCookies", () => ({ cookies: [] }));
+    f.chrome.handle("Page.getNavigationHistory", () => ({
+      currentIndex: 0,
+      entries: [],
+    }));
+    f.chrome.handle("Storage.clearDataForOrigin", ({ origin }) => {
+      cleared.push(origin);
+      if (cleared.length === 1) return;
+      abort.abort(reason);
+      return NO_REPLY;
+    });
+    await assert.rejects(f.runtime.clearPlatform(abort.signal), (error) => {
+      assert.ok(error instanceof ClearSiteDataError);
+      assert.equal(error.cause, reason);
+      assert.deepEqual(error.result.origins, [cleared[0]]);
+      return true;
+    });
+    assert.equal(cleared.length, 2);
+    assert.equal(admin!.closed, false);
     f.chrome.assertDone();
   } finally {
     await f.close();

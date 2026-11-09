@@ -1,9 +1,4 @@
-import {
-  InputActionError,
-  StaleElementError,
-  TimeoutError,
-  type Tab,
-} from "nodriver-ts";
+import type { Tab } from "nodriver-ts";
 import type { Configuration } from "../config.ts";
 import type { Task } from "../storage/repository.ts";
 import { resource } from "../domain/identity.ts";
@@ -171,57 +166,36 @@ export async function activate(tab: Tab, s: Section, ctx: DiscoveryContext) {
   await rating(tab, ctx);
   await dismissOverlays(tab, ctx.lease.signal);
   const selector = `dl.chapter-list-box[id$="${s.id}"]`;
-  for (let n = 0; n < 3; n++) {
+  const row = tab.locator(`${selector} .section-item-wrapper`);
+  try {
     ctx.auth.assert(ctx.lease);
-    try {
-      const box = await tab.waitForSelector(
-        `${selector} .section-item-wrapper`,
-        {
-          timeout: 10000,
-          signal: ctx.lease.signal,
-        },
-      );
-      // The platform can activate the first chapter itself during page startup.
-      if (
-        await box.evaluate((e) =>
-          e.closest("dl.chapter-list-box")?.classList.contains("focus"),
-        )
-      )
-        return selector;
-      await box.click({
-        signal: ctx.lease.signal,
-        timeout: 5000,
-        guard: () => ctx.auth.assert(ctx.lease),
-      });
-      await tab.waitForFunction(
+    // The platform can activate the first chapter itself during page startup.
+    if (
+      await tab.evaluate(
         (selector) =>
           document.querySelector(selector)?.classList.contains("focus"),
         selector,
-        { timeout: 5000, signal: ctx.lease.signal },
-      );
-      return selector;
-    } catch (e) {
-      if (ctx.lease.signal.aborted) throw e;
-      if (!tab.closed) await inspectAccess(tab, ctx.lease.signal);
-      // The SPA can replace chapter rows after the initial API response. A
-      // click interrupted before dispatch is safe to retry with a fresh row.
-      const detachedBeforeInput =
-        e instanceof InputActionError &&
-        e.report.events === 0 &&
-        e.report.completedSegments === 0 &&
-        e.cause instanceof StaleElementError;
-      if (detachedBeforeInput) {
-        const cleanup = await e.cleanup;
-        if (cleanup.status !== "completed") throw e;
-      } else if (
-        !(e instanceof StaleElementError) &&
-        !(e instanceof TimeoutError)
+        { timeout: 5000, signal: ctx.lease.signal, world: "isolated" },
       )
-        throw e;
-    }
-    await sleep(500, ctx.lease.signal);
+    )
+      return selector;
+    await row.click({
+      signal: ctx.lease.signal,
+      timeout: 10000,
+      guard: () => ctx.auth.assert(ctx.lease),
+    });
+    await tab.waitForFunction(
+      (selector) =>
+        document.querySelector(selector)?.classList.contains("focus"),
+      selector,
+      { timeout: 5000, signal: ctx.lease.signal },
+    );
+    return selector;
+  } catch (e) {
+    if (ctx.lease.signal.aborted) throw e;
+    if (!tab.closed) await inspectAccess(tab, ctx.lease.signal);
+    throw e;
   }
-  throw new ReviewRequired("section_activation_failed", "章节未进入学习状态");
 }
 async function resumeMedia(tab: Tab, selector: string, ctx: DiscoveryContext) {
   ctx.auth.assert(ctx.lease);
@@ -480,7 +454,6 @@ async function learnSubjectLinks(task: Task, ctx: DiscoveryContext) {
         });
       })();
       const [child] = await Promise.all([popup, click]);
-      ctx.scope.tabs.add(child);
       await sleep(10000, ctx.lease.signal);
       await child.close();
     }

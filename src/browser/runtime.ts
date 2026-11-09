@@ -1,15 +1,15 @@
-import { Browser, type BrowserContext, type Tab } from "nodriver-ts";
+import {
+  Browser,
+  ClearSiteDataError,
+  type BrowserContext,
+  type Tab,
+  type TabScope as BrowserTabScope,
+} from "nodriver-ts";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import {
-  createProfile,
-  validateProfile,
-  removeProfile,
-  prepareProjectProfile,
-} from "./profile.ts";
+import { prepareProjectProfile } from "./profile.ts";
 import type { Logger } from "../log.ts";
-import { navigateDocument } from "./navigation.ts";
 const loopback = (host: string) =>
   ["127.0.0.1", "localhost", "::1", "[::1]"].includes(host.replace(/^\./, ""));
 
@@ -69,10 +69,8 @@ export function executable(override?: string): string {
 export class BrowserRuntime {
   readonly browser: Browser;
   readonly context: BrowserContext;
-  readonly profile?: string;
-  private readonly temporaryProfile: boolean;
+  private readonly logger: Logger;
   private startupTab?: Tab;
-  private readonly startupTabId?: string;
   management?: Tab;
   readonly retained = new Set<Tab>();
   private origins = new Set([
@@ -84,16 +82,10 @@ export class BrowserRuntime {
     "https://ctexpert.cn",
   ]);
   private unsubscribe: () => void;
-  private constructor(
-    browser: Browser,
-    logger: Logger,
-    profile?: string,
-    temporaryProfile = true,
-  ) {
+  private constructor(browser: Browser, logger: Logger) {
     this.browser = browser;
     this.context = browser.defaultContext;
-    this.profile = profile;
-    this.temporaryProfile = temporaryProfile;
+    this.logger = logger;
     // Capture only the launch tab, before any business scopes create their tabs.
     this.startupTab = this.context.tabs.find(
       (tab) =>
@@ -101,13 +93,10 @@ export class BrowserRuntime {
         tab.url === "about:blank" &&
         !browser.targetInfo.get(tab.id)?.openerId,
     );
-    this.startupTabId = this.startupTab?.id;
     this.unsubscribe = browser.cdp.on(
       "Target.targetInfoChanged",
       ({ targetInfo }) => this.note(targetInfo.url),
     );
-    for (const tab of browser.tabs) tab.setInputPolicy({ mode: "human" });
-    browser.tabCreated.on((tab) => tab.setInputPolicy({ mode: "human" }));
     browser.errors.on((error) => logger.log(error, "warn"));
   }
   static async launch(
@@ -115,34 +104,26 @@ export class BrowserRuntime {
     path?: string,
     profileDirectory?: string,
   ) {
-    const executablePath = executable(path),
-      profile = profileDirectory
-        ? await prepareProjectProfile(profileDirectory)
-        : await createProfile();
-    try {
-      await validateProfile(profile);
-      const browser = await Browser.launch({
-        executablePath,
-        userDataDir: profile,
-        headless: false,
-        detached: true,
-        supervised: true,
-        timeout: 30000,
-        preset: "agent",
-        args: [
-          "--disable-background-timer-throttling",
-          "--disable-extensions",
-          "--disable-sync",
-          "--profile-directory=Default",
-          "--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWebRTC,msForceBrowserSignIn,msImplicitSignin,msEdgeOnRampFRE",
-        ],
-        onError: (e) => logger.log(e, "warn"),
-      });
-      return new BrowserRuntime(browser, logger, profile, !profileDirectory);
-    } catch (e) {
-      if (!profileDirectory) await removeProfile(profile);
-      throw e;
-    }
+    const browser = await Browser.launch({
+      executablePath: executable(path),
+      userDataDir: profileDirectory,
+      prepareProfile: prepareProjectProfile,
+      inputPolicy: { mode: "human" },
+      headless: false,
+      detached: true,
+      supervised: true,
+      timeout: 30000,
+      preset: "agent",
+      args: [
+        "--disable-background-timer-throttling",
+        "--disable-extensions",
+        "--disable-sync",
+        "--profile-directory=Default",
+        "--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWebRTC,msForceBrowserSignIn,msImplicitSignin,msEdgeOnRampFRE",
+      ],
+      onError: (e) => logger.log(e, "warn"),
+    });
+    return new BrowserRuntime(browser, logger);
   }
   static fromBrowser(browser: Browser, logger: Logger) {
     return new BrowserRuntime(browser, logger);
@@ -154,126 +135,139 @@ export class BrowserRuntime {
         this.origins.add(u.origin);
     } catch {}
   }
-  async acquireTab() {
+  takeStartupTab() {
     const startup = this.startupTab;
     this.startupTab = undefined;
-    return startup && !startup.closed ? startup : this.context.newTab();
+    return startup && !startup.closed ? startup : undefined;
   }
-  async releaseTab(tab: Tab) {
+  returnStartupTab(tab: Tab) {
     // Sequential work before the workbench opens reuses the launch tab.
-    if (!this.management && tab.id === this.startupTabId && !tab.closed)
+    if (!this.management && !this.retained.has(tab) && !tab.closed)
       this.startupTab = tab;
-    else await tab.close();
   }
   async openManagement(url: string) {
-    this.management = await this.acquireTab();
-    await this.management.goto(url);
+    this.management = this.takeStartupTab() || (await this.context.newTab());
+    await this.management.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: 30000,
+    });
     await this.management.bringToFront();
     return this.management;
   }
   scope(signal: AbortSignal) {
     return new TabScope(this, signal);
   }
-  async clearPlatform() {
+  async clearPlatform(signal?: AbortSignal) {
+    signal?.throwIfAborted();
     // Close platform pages first; they must not repopulate storage during invalidation.
+    const closing = this.context.tabScope();
     for (const tab of this.context.tabs)
       if (tab !== this.management && !tab.url.startsWith("http://127.0.0.1:")) {
         this.note(tab.url);
-        await tab.close();
+        for (const origin of tab.origins) this.note(origin);
+        closing.adopt(tab);
       }
+    await closing.close();
     this.retained.clear();
-    const session = this.management?.cdp || this.context.tabs[0]?.cdp;
-    if (!session) throw new Error("平台会话清理缺少活动页面");
+    signal?.throwIfAborted();
+    const domains = new Set(
+      [...this.origins].map((origin) => new URL(origin).hostname),
+    );
     for (const cookie of await this.context.cookies()) {
       if (!loopback(cookie.domain))
-        this.origins.add(`https://${cookie.domain.replace(/^\./, "")}`);
+        domains.add(cookie.domain.replace(/^\./, ""));
     }
-    for (const origin of this.origins)
-      await session.send("Storage.clearDataForOrigin", {
-        origin,
-        storageTypes: "all",
+    try {
+      return await this.context.clearSiteData({
+        domains: [...domains],
+        origins: [...this.origins],
+        // Closing business tabs discarded their sessionStorage. Do not use its
+        // history-based matching on the reused local management page.
+        types: [
+          "cookies",
+          "localStorage",
+          "indexedDB",
+          "cacheStorage",
+          "serviceWorkers",
+        ],
+        openTabs: "close",
+        timeout: 30000,
+        signal,
       });
-    // Explicit cookie deletion catches domain cookies not covered by origin storage.
-    for (const cookie of await this.context.cookies())
-      if (!loopback(cookie.domain)) {
-        await session.send("Network.deleteCookies", {
-          name: cookie.name,
-          domain: cookie.domain,
-          path: cookie.path,
-          ...(cookie.partitionKey ? { partitionKey: cookie.partitionKey } : {}),
-        });
-      }
+    } catch (error) {
+      if (error instanceof ClearSiteDataError)
+        this.logger.log(
+          `平台会话清理未完成：已处理 ${error.result.tabs.length} 个页面、${error.result.origins.length} 个站点、${error.result.cookies.length} 条 Cookie`,
+          "warn",
+        );
+      throw error;
+    }
   }
   async close() {
     this.unsubscribe();
     await this.browser.close();
-    if (this.profile) {
-      if (
-        this.browser.process &&
-        !(await this.browser.process.waitForExit(10000))
-      )
-        throw new Error("浏览器尚未退出，配置目录已保留");
-      if (this.temporaryProfile) await removeProfile(this.profile);
-    }
   }
 }
 export class TabScope {
   readonly runtime: BrowserRuntime;
   readonly signal: AbortSignal;
-  readonly tabs = new Set<Tab>();
-  private stop: () => void;
-  private cancelled = false;
-  private abortListener: () => void;
+  private readonly pages: BrowserTabScope;
+  private readonly borrowed = new Set<Tab>();
+  private startup?: Tab;
+  private closing?: Promise<void>;
+  private readonly abortListener: () => void;
   constructor(runtime: BrowserRuntime, signal: AbortSignal) {
     this.runtime = runtime;
     this.signal = signal;
-    this.stop = runtime.browser.tabCreated.on((tab) => {
-      const opener = runtime.browser.targetInfo.get(tab.id)?.openerId;
-      if (opener && [...this.tabs].some((t) => t.id === opener))
-        this.tabs.add(tab);
-    });
+    this.pages = runtime.context.tabScope();
     this.abortListener = () => {
-      this.cancelled = true;
       void this.close().catch(() => {});
     };
     signal.addEventListener("abort", this.abortListener, { once: true });
   }
+  get tabs(): Tab[] {
+    return [...this.pages.tabs, ...this.borrowed].filter((tab) => !tab.closed);
+  }
   async open(url?: string, timeout = 30000) {
     this.signal.throwIfAborted();
-    const tab = await this.runtime.acquireTab();
-    this.tabs.add(tab);
-    if (this.cancelled || this.signal.aborted) {
-      await this.runtime.releaseTab(tab);
+    if (this.pages.closed) throw new Error("任务页面作用域已关闭");
+    if (url) this.runtime.note(url);
+    const options = {
+      timeout,
+      signal: this.signal,
+      waitUntil: "domcontentloaded" as const,
+    };
+    try {
+      const tab = this.runtime.management
+        ? undefined
+        : this.runtime.takeStartupTab();
+      if (!tab) return await this.pages.newTab(url, options);
+      this.pages.borrow(tab);
+      this.borrowed.add(tab);
+      this.startup = tab;
+      if (url) await tab.goto(url, options);
+      return tab;
+    } catch (error) {
       this.signal.throwIfAborted();
+      throw error;
     }
-    if (url) {
-      this.runtime.note(url);
-      try {
-        await navigateDocument(tab, url, this.signal, timeout);
-      } catch (e) {
-        await this.runtime.releaseTab(tab).catch(() => {});
-        this.tabs.delete(tab);
-        throw e;
-      }
-    }
-    return tab;
   }
   retain(tab: Tab) {
-    if (!this.tabs.has(tab)) throw new Error("标签不属于当前任务");
+    if (!this.tabs.includes(tab)) throw new Error("标签不属于当前任务");
+    // Preserve the review page while still owning any popups it opens this round.
+    this.pages.borrow(tab);
+    this.borrowed.add(tab);
     this.runtime.retained.add(tab);
   }
-  async close() {
-    this.stop();
-    this.signal.removeEventListener("abort", this.abortListener);
-    const errors = await Promise.allSettled(
-      [...this.tabs]
-        .filter(
-          (t) => !this.runtime.retained.has(t) && t !== this.runtime.management,
-        )
-        .map((t) => this.runtime.releaseTab(t)),
-    );
-    this.tabs.clear();
-    const failed = errors.find((r) => r.status === "rejected");
-    if (failed?.status === "rejected") throw failed.reason;
+  close(): Promise<void> {
+    return (this.closing ??= (async () => {
+      this.signal.removeEventListener("abort", this.abortListener);
+      try {
+        await this.pages.close();
+      } finally {
+        if (this.startup) this.runtime.returnStartupTab(this.startup);
+        this.borrowed.clear();
+      }
+    })());
   }
 }

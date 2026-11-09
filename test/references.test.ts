@@ -2,6 +2,7 @@ import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { runInNewContext } from "node:vm";
 import { references } from "../src/platform/references.ts";
 import { Repository } from "../src/storage/repository.ts";
 import type { DiscoveryContext } from "../src/platform/discovery.ts";
@@ -18,6 +19,8 @@ async function fixture(t: TestContext) {
     opened: 0,
     closed: 0,
     guide: true,
+    savedCookieOnly: false,
+    sameNames: false,
   };
   let abort = new AbortController();
   const ctx = {
@@ -35,10 +38,21 @@ async function fixture(t: TestContext) {
             state.closed++;
           },
           async waitForFunction() {},
-          async evaluate(_fn: unknown, arg: any) {
-            if (!arg?.url) return "synthetic";
+          async evaluate(fn: Function, arg: unknown) {
+            return runInNewContext(`(${fn.toString()})`, {
+              location: { origin: "https://kc.zhixueyun.com" },
+              document: {
+                cookie: state.savedCookieOnly ? "" : "authorization=synthetic",
+              },
+              localStorage: {
+                getItem: (key: string) =>
+                  key === "save_cookie" ? "authorization=synthetic" : null,
+              },
+            })(arg);
+          },
+          async fetch(url: string) {
             let value;
-            if (arg.url.includes("/course-front/info/")) {
+            if (url.includes("/course-front/info/")) {
               if (state.failInfo)
                 throw new Error("temporary course-info failure");
               value = {
@@ -50,36 +64,45 @@ async function fixture(t: TestContext) {
                       {
                         id: "section-a",
                         resourceId: "resource-a",
-                        name: "课件 A",
+                        name: state.sameNames ? "同名课件" : "课件 A",
                         fileType: "pdf",
                         guideStudyFlag: state.guide,
                       },
                       {
                         id: "section-b",
                         resourceId: "resource-b",
-                        name: "课件 B",
+                        name: state.sameNames ? "同名课件" : "课件 B",
                         fileType: "pdf",
+                        guideStudyFlag: state.sameNames,
                       },
                     ],
                   },
                 ],
               };
-            } else if (arg.url.includes("/preview?"))
-              value = { url: "https://cdn.zhixueyun.com/file.pdf" };
-            else if (arg.url.includes("/get-guide-study-info?")) {
+            } else if (url.includes("/preview?"))
+              value = { url: "https://kc.zhixueyun.com/api/file.pdf" };
+            else if (url.includes("/get-guide-study-info?")) {
               state.guides++;
               value = [{ name: "导学", content: "学习说明" }];
             } else throw new Error("Unexpected API");
-            return { status: 200, value };
+            return { status: 200, ok: true, body: JSON.stringify(value) };
           },
         };
       },
     },
   } as unknown as DiscoveryContext;
-  t.mock.method(globalThis, "fetch", async () => {
-    state.downloads++;
-    return new Response("%PDF-1.7\nfixture");
-  });
+  t.mock.method(
+    globalThis,
+    "fetch",
+    async (_url: unknown, options: RequestInit) => {
+      assert.equal(
+        new Headers(options.headers).get("Authorization"),
+        "synthetic",
+      );
+      state.downloads++;
+      return new Response("%PDF-1.7\nfixture");
+    },
+  );
   const output = join(temp.dir, "references", "a", task.businessId);
   return {
     temp,
@@ -138,6 +161,43 @@ test("reference retries preserve successful indexes, reuse validated files and r
     assert.equal(f.state.downloads, 3);
     assert.equal(f.state.guides, 2);
     assert.equal((await f.saved()).files.length, 3);
+  } finally {
+    await f.close();
+  }
+});
+
+test("distinct resources with the same title and ID prefix keep separate files and guides", async (t) => {
+  const f = await fixture(t);
+  try {
+    f.state.sameNames = true;
+    const result = await f.run();
+    assert.equal(result.complete, true);
+    assert.equal(result.files.length, 4);
+    assert.equal(new Set(result.files.map((file) => file.path)).size, 4);
+    assert.equal(
+      new Set(
+        result.files
+          .filter((file) => file.markdown)
+          .map((file) => file.markdown),
+      ).size,
+      2,
+    );
+    assert.equal((await f.run()).complete, true);
+    assert.equal(f.state.downloads, 2);
+    assert.equal(f.state.guides, 2);
+  } finally {
+    await f.close();
+  }
+});
+
+test("reference downloads use the same saved-cookie authorization as platform API requests", async (t) => {
+  const f = await fixture(t);
+  try {
+    f.state.savedCookieOnly = true;
+    const result = await f.run();
+    assert.equal(result.complete, true);
+    assert.equal(result.files.length, 3);
+    assert.equal(f.state.downloads, 2);
   } finally {
     await f.close();
   }

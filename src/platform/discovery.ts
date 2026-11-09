@@ -976,101 +976,107 @@ async function casePoolManifest(
 ): Promise<Manifest> {
   ctx.auth.assert(ctx.lease);
   if (!isCasePoolUrl(tab.url)) throw new Error("案例库页面已变化，请重新解析");
-  // Requests remain inside the authenticated case-pool origin; tokens never leave the page.
-  const result = await tab.evaluate(
-    async () => {
-      const values: string[] = [],
-        seenTags = new Set<string>();
-      const signal = AbortSignal.timeout(90000);
+  const values: string[] = [],
+    seenTags = new Set<string>();
+  const signal = AbortSignal.any([
+    ctx.lease.signal,
+    AbortSignal.timeout(90000),
+  ]);
+  const token = await tab.evaluate(
+    () => {
       if (
         location.origin !== "https://www.ctexpert.cn" ||
         location.pathname.replace(/\/$/, "") !== "/expert-assist-web/casePool"
       )
-        return { values, complete: false };
-      const token = localStorage.getItem("userID");
-      if (!token) return { values, complete: false };
-      const request = async (path: string, body: unknown) => {
-        const r = await fetch(path, {
-          method: "POST",
-          redirect: "error",
-          signal,
-          headers: { "Content-Type": "application/json", token },
-          body: JSON.stringify(body),
-        });
-        if (!r.ok) throw new Error("请求失败");
-        const j = await r.json();
-        if (Number(j.code) !== 200) throw new Error("请求被拒绝");
-        return j.data;
-      };
-      try {
-        const roots = await request(
-          "/expert-assist-case/tag/listTree?source=home",
-          { source: "home" },
-        );
-        const root = roots.find((r: any) => r.name === "案例资源");
-        if (!root || !Array.isArray(root.childrenList))
-          throw new Error("分类不完整");
-        const tags: any[] = [];
-        const visit = (n: any, depth = 0) => {
-          if (depth > 12) throw new Error("分类层级过深");
-          if (n?.id == null || seenTags.has(String(n.id))) return;
-          seenTags.add(String(n.id));
-          tags.push(n.id);
-          for (const c of n.childrenList || []) visit(c, depth + 1);
-        };
-        for (const c of root.childrenList) visit(c);
-        if (!tags.length) throw new Error("分类为空");
-        for (const tag of tags) {
-          const seen = new Set<string>();
-          let ended = false;
-          for (let pageNum = 1; pageNum <= 200; pageNum++) {
-            const d = await request(
-              "/expert-assist-case/case/getCaseHomeList",
-              {
-                classifyTagId: tag,
-                sortFiled: "",
-                sortType: "",
-                pageSize: 100,
-                pageNum,
-              },
-            );
-            if (!Array.isArray(d?.records)) throw new Error("列表缺失");
-            let added = 0;
-            for (const r of d.records) {
-              const key = String(r.id ?? r.caseId ?? r.url ?? "");
-              if (!key) throw new Error("标识缺失");
-              if (!seen.has(key)) {
-                seen.add(key);
-                added++;
-              }
-              if (typeof r.url === "string") values.push(r.url);
-            }
-            const total = d.total == null ? null : Number(d.total);
-            if (
-              (total !== null &&
-                Number.isFinite(total) &&
-                seen.size >= total) ||
-              (total === null && !d.records.length)
-            ) {
-              ended = true;
-              break;
-            }
-            if (!added) throw new Error("分页停滞");
-          }
-          if (!ended) throw new Error("分页上限");
-        }
-        return { values, complete: true };
-      } catch {
-        return { values, complete: false };
-      }
+        throw new Error("案例库页面已变化，请重新解析");
+      return localStorage.getItem("userID");
     },
     undefined,
-    { timeout: 95000, signal: ctx.lease.signal },
+    { signal, timeout: 5000, world: "isolated" },
   );
+  let complete = false;
+  const request = async (path: string, body: unknown) => {
+    ctx.auth.assert(ctx.lease);
+    if (!token) throw new Error("案例库未登录");
+    const r = await tab.fetch<any>(
+      new URL(path, "https://www.ctexpert.cn").href,
+      {
+        method: "POST",
+        redirect: "error",
+        mode: "same-origin",
+        responseType: "json",
+        timeout: 90000,
+        signal,
+        headers: { "Content-Type": "application/json", token },
+        body: JSON.stringify(body),
+      },
+    );
+    ctx.auth.assert(ctx.lease);
+    if (!r.ok) throw new Error("请求失败");
+    const j = r.body;
+    if (Number(j.code) !== 200) throw new Error("请求被拒绝");
+    return j.data;
+  };
+  try {
+    const roots = await request(
+      "/expert-assist-case/tag/listTree?source=home",
+      { source: "home" },
+    );
+    const root = roots.find((r: any) => r.name === "案例资源");
+    if (!root || !Array.isArray(root.childrenList))
+      throw new Error("分类不完整");
+    const tags: any[] = [];
+    const visit = (n: any, depth = 0) => {
+      if (depth > 12) throw new Error("分类层级过深");
+      if (n?.id == null || seenTags.has(String(n.id))) return;
+      seenTags.add(String(n.id));
+      tags.push(n.id);
+      for (const c of n.childrenList || []) visit(c, depth + 1);
+    };
+    for (const c of root.childrenList) visit(c);
+    if (!tags.length) throw new Error("分类为空");
+    for (const tag of tags) {
+      const seen = new Set<string>();
+      let ended = false;
+      for (let pageNum = 1; pageNum <= 200; pageNum++) {
+        const d = await request("/expert-assist-case/case/getCaseHomeList", {
+          classifyTagId: tag,
+          sortFiled: "",
+          sortType: "",
+          pageSize: 100,
+          pageNum,
+        });
+        if (!Array.isArray(d?.records)) throw new Error("列表缺失");
+        let added = 0;
+        for (const r of d.records) {
+          const key = String(r.id ?? r.caseId ?? r.url ?? "");
+          if (!key) throw new Error("标识缺失");
+          if (!seen.has(key)) {
+            seen.add(key);
+            added++;
+          }
+          if (typeof r.url === "string") values.push(r.url);
+        }
+        const total = d.total == null ? null : Number(d.total);
+        if (
+          (total !== null && Number.isFinite(total) && seen.size >= total) ||
+          (total === null && !d.records.length)
+        ) {
+          ended = true;
+          break;
+        }
+        if (!added) throw new Error("分页停滞");
+      }
+      if (!ended) throw new Error("分页上限");
+    }
+    complete = true;
+  } catch {
+    ctx.auth.assert(ctx.lease);
+  }
   ctx.auth.assert(ctx.lease);
   return {
-    links: extractLinks(result.values, tab.url),
-    complete: result.complete,
-    message: result.complete ? undefined : "案例库登录或分页未完整确认",
+    links: extractLinks(values, tab.url),
+    complete,
+    message: complete ? undefined : "案例库登录或分页未完整确认",
   };
 }

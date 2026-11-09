@@ -268,16 +268,26 @@ export class Repository {
       .prepare("DELETE FROM edges WHERE parent=? AND child=?")
       .run(parent, child);
   }
-  refreshParents(id: string, seen = new Set<string>()) {
-    if (seen.has(id)) return;
-    seen.add(id);
-    for (const row of this.db
-      .prepare("SELECT parent FROM edges WHERE child=?")
-      .all(id)) {
-      const parent = String(row.parent);
+  refreshParents(id: string) {
+    const pending = new Set(
+      this.db
+        .prepare(
+          "WITH RECURSIVE ancestors(id) AS (SELECT parent FROM edges WHERE child=? UNION SELECT e.parent FROM edges e JOIN ancestors a ON e.child=a.id) SELECT id FROM ancestors",
+        )
+        .all(id)
+        .map((row) => String(row.id)),
+    );
+    // Shared ancestors must wait for every affected child. A depth-first walk
+    // through parents can otherwise publish completion before a sibling updates.
+    const refresh = (parent: string) => {
+      if (!pending.delete(parent)) return;
+      for (const row of this.db
+        .prepare("SELECT child FROM edges WHERE parent=?")
+        .all(parent))
+        if (pending.has(String(row.child))) refresh(String(row.child));
       this.refreshContainer(parent);
-      this.refreshParents(parent, seen);
-    }
+    };
+    for (const parent of pending) refresh(parent);
   }
   reconcile(id: string) {
     this.refreshContainer(id);

@@ -43,19 +43,31 @@ async function fixture(t: TestContext) {
     tab = await open();
     t.mock.method(tab, "bringToFront", async () => {});
     t.mock.method(tab.mainFrame, "queryAll", async () => []);
-    t.mock.method(tab, "waitForNavigation", async () => "");
-    t.mock.method(
-      tab.cdp,
-      "sendWith",
-      async (_method: string, _options: unknown, params: { url: string }) => {
-        navigations.push(params.url);
-        return { frameId: tab.mainFrame.id };
-      },
-    );
+    t.mock.method(tab, "goto", async (url: string) => {
+      navigations.push(url);
+      return url;
+    });
     t.mock.method(tab, "waitForFunction", async (_fn: unknown, arg: unknown) =>
       arg === HOME ? ready() : true,
     );
-    t.mock.method(tab, "evaluate", async () => profile());
+    t.mock.method(tab, "evaluate", async () => "synthetic-token");
+    t.mock.method(tab, "fetch", async (url: string, options: any) => {
+      assert.equal(url, `${CENTER}/api/personal/user/info`);
+      assert.equal(options.signal, abort.signal);
+      assert.equal(options.mode, "same-origin");
+      assert.equal(options.headers["x-token"], "synthetic-token");
+      const result = await profile();
+      return {
+        ok: true,
+        body: JSON.stringify({
+          code: 0,
+          data: {
+            id: result.account.replace(/^center:/, ""),
+            name: result.name,
+          },
+        }),
+      };
+    });
     return tab;
   });
   return {
@@ -155,11 +167,31 @@ test("credential verification reuses the bootstrap tab and rejects a different a
   const f = await fixture(t);
   try {
     await assert.rejects(f.app.auth.lease(f.scope), /账号与凭证不一致/);
+    assert.equal(f.app.dashboard().credential.status, "invalid");
+    assert.deepEqual(f.app.dashboard().recommended, {
+      kind: "login",
+      label: "更新登录凭证",
+    });
     assert.deepEqual(f.urls, [HOME]);
     assert.deepEqual(f.navigations, [`${CENTER}/PC/home`]);
     assert.equal(f.tab.closed, true);
     assert.equal(f.admin.closed, false);
     assert.equal(await readFile(f.app.auth.path, "utf8"), f.original);
+  } finally {
+    await f.close();
+  }
+});
+
+test("revoked credentials update the dashboard until verified again", async (t) => {
+  const f = await fixture(t);
+  try {
+    assert.equal(f.app.dashboard().credential.status, "valid");
+    f.app.auth.invalidate();
+    assert.equal(f.app.dashboard().credential.status, "invalid");
+    assert.equal(f.app.dashboard().recommended.kind, "login");
+    f.profile(async () => ({ account: "center:old", name: "Old" }));
+    await f.app.auth.lease(f.scope);
+    assert.equal(f.app.dashboard().credential.status, "valid");
   } finally {
     await f.close();
   }

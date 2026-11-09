@@ -261,6 +261,15 @@ export async function selectedAnswers(
     { timeout: 5000, signal },
   );
 }
+export function sameAnswers(
+  type: string,
+  actual: string[],
+  expected: string[],
+) {
+  return type === "ordering"
+    ? actual.join("") === expected.join("")
+    : [...actual].sort().join("") === [...expected].sort().join("");
+}
 export async function applyAnswers(
   tab: Tab,
   q: Question,
@@ -273,11 +282,14 @@ export async function applyAnswers(
   const prefix = q.selector ? `${q.selector} ` : "";
   if (q.type === "ordering") {
     ctx.auth.assert(ctx.lease);
-    const input = await tab.query(`${prefix}.answer-input-shot`, {
-      signal: ctx.lease.signal,
-      timeout: 5000,
-    });
-    if (!input) return false;
+    const input = tab.locator(`${prefix}.answer-input-shot`);
+    if (
+      !(await input.count({
+        signal: ctx.lease.signal,
+        timeout: 5000,
+      }))
+    )
+      return false;
     await input.fill(answers.join(""), {
       signal: ctx.lease.signal,
       timeout: 5000,
@@ -302,27 +314,42 @@ export async function applyAnswers(
         timeout: 5000,
       });
       if (elements.length !== q.options.length) return false;
-      const control =
-        (await elements[index].query(
-          'input[type="checkbox"],input[type="radio"]',
-          { visible: true, timeout: 3000, signal: ctx.lease.signal },
-        )) || elements[index];
+      const element = elements[index];
+      const control = (await element.evaluate((e) =>
+        e.matches('input[type="checkbox"],input[type="radio"]'),
+      ))
+        ? element
+        : await element.query('input[type="checkbox"],input[type="radio"]', {
+            timeout: 3000,
+            signal: ctx.lease.signal,
+          });
       ctx.auth.assert(ctx.lease);
-      await control.click({
+      const inputOptions = {
         signal: ctx.lease.signal,
         timeout: 5000,
         guard: () => ctx.auth.assert(ctx.lease),
-      });
-      await sleep(300, ctx.lease.signal);
+      };
+      const native =
+        control &&
+        (await control.evaluate((element) => {
+          const input = element as HTMLInputElement;
+          return [input, ...Array.from(input.labels || [])].some((target) =>
+            target.checkVisibility({ visibilityProperty: true }),
+          );
+        }));
+      if (native) {
+        await control.setChecked(
+          answers.includes(q.options[index].label),
+          inputOptions,
+        );
+      } else {
+        await element.click(inputOptions);
+        await sleep(300, ctx.lease.signal);
+      }
     }
   }
   const result = await selectedAnswers(tab, q, ctx.lease.signal);
-  return (
-    !!result &&
-    (q.type === "ordering"
-      ? result.join("") === answers.join("")
-      : result.sort().join("") === [...answers].sort().join(""))
-  );
+  return !!result && sameAnswers(q.type, result, answers);
 }
 export async function runExam(
   task: Task,
@@ -512,10 +539,11 @@ export async function runExam(
         const selected = await selectedAnswers(tab, q, ctx.lease.signal);
         if (
           !e ||
+          q.type !== e.q.type ||
           q.text !== e.q.text ||
           JSON.stringify(q.options) !== JSON.stringify(e.q.options) ||
           !selected ||
-          selected.sort().join("") !== [...e.answers].sort().join("")
+          !sameAnswers(q.type, selected, e.answers)
         )
           permitted = false;
       }

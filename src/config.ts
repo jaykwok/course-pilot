@@ -127,9 +127,13 @@ export function prepareSettings(
   clearKey = false,
 ): Settings {
   const settings = validateSettings(input);
+  const saved = readSettings(path);
   settings.openai.apiKey = clearKey
     ? ""
-    : settings.openai.apiKey || readSettings(path).openai.apiKey;
+    : settings.openai.apiKey ||
+      (settings.openai.baseURL === saved.openai.baseURL
+        ? saved.openai.apiKey
+        : "");
   return settings;
 }
 export async function saveSettings(path: string, settings: Settings) {

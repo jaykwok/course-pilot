@@ -501,6 +501,42 @@ test(
         "Checking that live queue refresh preserves the selected scope",
       );
       await liveQueueChecks(page, app);
+      t.diagnostic(
+        "Checking revoked credentials update the visible account state",
+      );
+      await atomicJson(app.auth.path, {
+        version: 2,
+        account: "center:fixture",
+        name: "测试账号",
+        expires: new Date(Date.now() + 86400000).toISOString(),
+        cookies: [
+          { name: "session", value: "fixture", domain: ".mylearning.cn" },
+        ],
+      });
+      app.update();
+      await page.waitForFunction(
+        () =>
+          document
+            .getElementById("credential-tag")!
+            .textContent!.includes("凭证剩余"),
+        undefined,
+        { timeout: 5000 },
+      );
+      app.auth.invalidate();
+      app.update();
+      await page.waitForFunction(
+        () =>
+          document.getElementById("operation-title")!.textContent ===
+            "登录凭证已失效" &&
+          document.getElementById("recommended")!.textContent ===
+            "更新登录凭证" &&
+          document.getElementById("credential-tag")!.textContent ===
+            "凭证已失效",
+        undefined,
+        { timeout: 5000 },
+      );
+      await atomicJson(app.auth.path, { version: 2, cookies: [] });
+      app.update();
       t.diagnostic("Checking settings and session isolation");
       await modelChecks(page, config.settingsPath);
       await page.setEnvironment({ viewport: { width: 1280, height: 900 } });
