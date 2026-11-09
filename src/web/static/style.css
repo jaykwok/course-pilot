@@ -2103,9 +2103,9 @@ dialog.sheet > form {
     animation: none !important;
     transition: none !important;
   }
-  /* Keep a quiet activity cue without rotation or sliding motion. */
+  /* Keep task activity recognizable with slower rotation and steady opacity. */
   .hero[data-phase="active"] .spinner {
-    animation: pulse 2s ease-in-out infinite !important;
+    animation: spin 3s linear infinite !important;
   }
 }
 

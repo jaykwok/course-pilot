@@ -98,46 +98,64 @@ export async function liveWorkbenchChecks(
     state: "playing",
   };
   await show(current, "正在播放");
-  await page.cdp.send("Emulation.setEmulatedMedia", {
-    features: [{ name: "prefers-reduced-motion", value: "no-preference" }],
-  });
-  await page.waitForFunction(
-    () => {
-      const spinner = document.querySelector(".spinner")!;
-      return (
-        getComputedStyle(spinner).animationName === "spin" &&
-        Number(spinner.getAnimations()[0]?.currentTime) > 1100
-      );
-    },
-    undefined,
-    { timeout: 5000 },
-  );
-  const rotation = await page.evaluate(() => {
-    const spinner = document.querySelector(".spinner")!;
-    const animation = spinner.getAnimations()[0];
-    const time = animation.currentTime;
-    animation.pause();
-    try {
-      // Sample inside a former 45-degree step, independent of the CI frame rate.
-      return [20, 40, 60, 80].map((sample) => {
-        animation.currentTime = sample;
-        const matrix = new DOMMatrixReadOnly(
-          getComputedStyle(spinner).transform,
+  const checkSpinner = async (
+    preference: "no-preference" | "reduce",
+    duration: number,
+  ) => {
+    await page.cdp.send("Emulation.setEmulatedMedia", {
+      features: [{ name: "prefers-reduced-motion", value: preference }],
+    });
+    await page.waitForFunction(
+      (duration) => {
+        const spinner = document.querySelector(".spinner")!;
+        const style = getComputedStyle(spinner);
+        return (
+          style.animationName === "spin" &&
+          parseFloat(style.animationDuration) * 1000 === duration &&
+          Number(spinner.getAnimations()[0]?.currentTime) > 1100
         );
-        return (Math.atan2(matrix.b, matrix.a) * 180) / Math.PI;
-      });
-    } finally {
-      animation.currentTime = time;
-      animation.play();
-    }
-  });
-  for (let i = 1; i < rotation.length; i++) {
-    const advance = rotation[i] - rotation[i - 1];
-    assert.ok(
-      advance > 0 && advance < 10,
-      `rotation must advance smoothly: ${rotation}`,
+      },
+      duration,
+      { timeout: 5000 },
     );
-  }
+    const { rotation, opacity } = await page.evaluate((duration) => {
+      const spinner = document.querySelector(".spinner")!;
+      const animation = spinner.getAnimations()[0];
+      const time = animation.currentTime;
+      animation.pause();
+      try {
+        // Sample inside a former 45-degree step, independent of the CI frame rate.
+        const rotation = [20, 40, 60, 80].map((sample) => {
+          animation.currentTime = sample;
+          const matrix = new DOMMatrixReadOnly(
+            getComputedStyle(spinner).transform,
+          );
+          return (Math.atan2(matrix.b, matrix.a) * 180) / Math.PI;
+        });
+        const opacity = [0, 0.25, 0.5, 0.75].map((fraction) => {
+          animation.currentTime = duration * fraction;
+          return Number(getComputedStyle(spinner).opacity);
+        });
+        return { rotation, opacity };
+      } finally {
+        animation.currentTime = time;
+        animation.play();
+      }
+    }, duration);
+    for (let i = 1; i < rotation.length; i++) {
+      const advance = rotation[i] - rotation[i - 1];
+      assert.ok(
+        Math.abs(advance - (360 * 20) / duration) < 0.1,
+        `${preference}: rotation must advance smoothly: ${rotation}`,
+      );
+    }
+    assert.deepEqual(
+      opacity,
+      [1, 1, 1, 1],
+      `${preference}: spinner must not blink`,
+    );
+  };
+  await checkSpinner("no-preference", 1200);
   assert.equal(
     await page.evaluate(
       () => document.getElementById("progress-time")!.textContent,
@@ -186,28 +204,7 @@ export async function liveWorkbenchChecks(
     { timeout: 5000 },
   );
   await show({ ...current, description: "下一节", completed: 2 }, "正在播放");
-  await page.cdp.send("Emulation.setEmulatedMedia", {
-    features: [{ name: "prefers-reduced-motion", value: "reduce" }],
-  });
-  const opacity = await page.evaluate(() => {
-    const style = getComputedStyle(document.querySelector(".spinner")!);
-    return {
-      name: style.animationName,
-      opacity: Number(style.opacity),
-      transform: style.transform,
-    };
-  });
-  assert.equal(opacity.name, "pulse");
-  assert.equal(opacity.transform, "none");
-  await page.waitForFunction(
-    (before) =>
-      Math.abs(
-        Number(getComputedStyle(document.querySelector(".spinner")!).opacity) -
-          before,
-      ) > 0.1,
-    opacity.opacity,
-    { timeout: 5000 },
-  );
+  await checkSpinner("reduce", 3000);
   await page.cdp.send("Emulation.setEmulatedMedia", { features: [] });
 
   for (const socket of server.sockets.clients) socket.terminate();
