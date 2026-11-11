@@ -774,6 +774,35 @@ test("subject learning refreshes nested activity progress without erasing incomp
   }
 });
 
+test("native course links in HTML and scripts retain their complete source without accepting truncated invalid links", () => {
+  const root = "https://cms.mylearning.cn/topic/project/pc.html";
+  const source = entry(SUBJECT, "a").businessId;
+  const canonical = `${COURSE}/5/1/${source}`;
+  const native = COURSE.replace("/detail/", "/detail/11&");
+  const relative = `${new URL(native).hash}/5/1/${source}`;
+  const inputs = [
+    `<a href="${relative}">课程</a>`,
+    `window.open('${relative}')`,
+    `${native}/5/1/${source}`,
+    canonical,
+  ];
+  for (const input of inputs)
+    assert.deepEqual(extractLinks([input], root), [canonical]);
+  assert.deepEqual(extractLinks(inputs, root), [canonical]);
+  assert.deepEqual(
+    extractLinks(
+      [
+        `window.open('${new URL(native).hash}&1/5/1/${source}')`,
+        `window.open('${relative}?required=0')`,
+        `<a href="${new URL(native).hash}/5/1/broken">无效来源</a>`,
+        `window.open('${new URL(COURSE).hash}/5/1/broken')`,
+      ],
+      root,
+    ),
+    [],
+  );
+});
+
 test("topic HTML extracts only containers and preserves relative course sources", () => {
   const root =
     "https://cms.mylearning.cn/safe/topic/resource/2020/lyljjh/pc.html";

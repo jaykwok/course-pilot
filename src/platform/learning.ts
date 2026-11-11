@@ -1,4 +1,4 @@
-import type { Tab } from "nodriver-ts";
+import { ActionabilityError, InputActionError, type Tab } from "nodriver-ts";
 import type { Configuration } from "../config.ts";
 import type { Task } from "../storage/repository.ts";
 import { resource } from "../domain/identity.ts";
@@ -167,23 +167,41 @@ export async function activate(tab: Tab, s: Section, ctx: DiscoveryContext) {
   await dismissOverlays(tab, ctx.lease.signal);
   const selector = `dl.chapter-list-box[id$="${s.id}"]`;
   const row = tab.locator(`${selector} .section-item-wrapper`);
+  const focused = () =>
+    tab.evaluate(
+      (selector) =>
+        document.querySelector(selector)?.classList.contains("focus"),
+      selector,
+      { timeout: 5000, signal: ctx.lease.signal, world: "isolated" },
+    );
+  const input = {
+    signal: ctx.lease.signal,
+    timeout: 10000,
+    guard: () => ctx.auth.assert(ctx.lease),
+  };
   try {
     ctx.auth.assert(ctx.lease);
     // The platform can activate the first chapter itself during page startup.
-    if (
-      await tab.evaluate(
-        (selector) =>
-          document.querySelector(selector)?.classList.contains("focus"),
-        selector,
-        { timeout: 5000, signal: ctx.lease.signal, world: "isolated" },
+    if (await focused()) return selector;
+    try {
+      await row.click(input);
+    } catch (error) {
+      if (
+        !(error instanceof InputActionError) ||
+        error.report.dispatched !== 0 ||
+        !(error.cause instanceof ActionabilityError)
       )
-    )
-      return selector;
-    await row.click({
-      signal: ctx.lease.signal,
-      timeout: 10000,
-      guard: () => ctx.auth.assert(ctx.lease),
-    });
+        throw error;
+      await error.cleanup;
+      ctx.auth.assert(ctx.lease);
+      await inspectAccess(tab, ctx.lease.signal);
+      // Late guide content can move the next chapter while the pointer travels.
+      // Reposition once only when no press was sent; retain native hit checks.
+      if (!(await focused())) {
+        await row.hover(input);
+        if (!(await focused())) await row.click(input);
+      }
+    }
     await tab.waitForFunction(
       (selector) =>
         document.querySelector(selector)?.classList.contains("focus"),

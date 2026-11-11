@@ -8,6 +8,7 @@ import {
 } from "../src/platform/exam.ts";
 import { sectionStates, activate } from "../src/platform/learning.ts";
 import {
+  ActionabilityError,
   InputActionError,
   Locator,
   TimeoutError,
@@ -143,6 +144,93 @@ test("chapter activation reacquires replaced rows but never replays partially di
       assert.equal(await operation, 'dl.chapter-list-box[id$="section"]');
       assert.equal(lookups, 2);
     }
+  }
+});
+
+test("chapter layout movement is repositioned once only before any press was dispatched", async () => {
+  for (const mode of [
+    "recover",
+    "pressed",
+    "repeat",
+    "auto-active",
+    "cancel",
+    "timeout",
+  ]) {
+    const abort = new AbortController();
+    let clicks = 0,
+      hovers = 0,
+      focused = false,
+      cleaned = false;
+    const report: InputReport = {
+      action: "click",
+      status: "interrupted",
+      seed: 1,
+      randomState: 1,
+      completedSegments: 0,
+      events: 52,
+      dispatched: mode === "pressed" ? 1 : 0,
+      trace: [],
+      cleanupErrors: [],
+      phase: "done",
+      cleanup: "completed",
+    };
+    const failure = new InputActionError(
+      report,
+      mode === "timeout"
+        ? new TimeoutError("timed out")
+        : new ActionabilityError("target moved"),
+      Promise.resolve().then(() => {
+        cleaned = true;
+        return { status: "completed" as const, report };
+      }),
+    );
+    const tab = {
+      async queryAll() {
+        return [];
+      },
+      async evaluate(_fn: unknown, arg: unknown) {
+        return typeof arg === "string"
+          ? focused
+          : { challenge: false, title: "课程", notices: [] };
+      },
+      locator() {
+        return {
+          async click() {
+            clicks++;
+            if (clicks === 1 || mode === "repeat") {
+              if (mode === "auto-active") focused = true;
+              if (mode === "cancel") abort.abort(new Error("cancelled"));
+              throw failure;
+            }
+            focused = true;
+          },
+          async hover() {
+            assert.equal(cleaned, true);
+            hovers++;
+          },
+        };
+      },
+      async waitForFunction() {
+        assert.equal(focused, true);
+      },
+    } as unknown as Tab;
+    const ctx = {
+      auth: {
+        assert() {
+          abort.signal.throwIfAborted();
+        },
+      },
+      lease: { signal: abort.signal },
+    } as unknown as DiscoveryContext;
+    const operation = activate(
+      tab,
+      { id: "s", resourceId: "r", sectionType: 1 },
+      ctx,
+    );
+    if (["recover", "auto-active"].includes(mode)) await operation;
+    else await assert.rejects(operation);
+    assert.equal(clicks, ["recover", "repeat"].includes(mode) ? 2 : 1, mode);
+    assert.equal(hovers, ["recover", "repeat"].includes(mode) ? 1 : 0, mode);
   }
 });
 

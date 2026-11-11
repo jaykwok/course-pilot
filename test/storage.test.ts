@@ -72,6 +72,34 @@ test("identity keeps tenant, account and source; QR aliases resolve", () => {
   ])
     assert.throws(() => normalize(url));
 });
+
+test("native course entrance links retain source identity when pasted or deduplicated", () => {
+  const source = entry(SUBJECT, "a").businessId;
+  const canonical = `${COURSE}/5/1/${source}`;
+  const native = COURSE.replace("/detail/", "/detail/11&");
+  for (const url of [
+    `${native}/5/1/${source}`,
+    `${native}&0/5/1/${source}`,
+    `${native}?type=5&required=1&sourceId=${source}`,
+  ]) {
+    assert.equal(normalize(url), canonical);
+    assert.equal(entry(url, "a").id, entry(canonical, "a").id);
+    assert.notEqual(entry(url, "a").id, entry(COURSE, "a").id);
+  }
+  assert.deepEqual(parseLinkInput(`${native}/5/1/${source}\n${canonical}`), {
+    urls: [canonical],
+    rejected: 0,
+  });
+  for (const invalid of [
+    `${native}/5/1/${source}?required=0`,
+    `${native}/5/1/${source}?sourceId=${entry(EXAM, "a").businessId}`,
+    `${native}/5/1/broken`,
+    `${native}&1/5/1/${source}`,
+    native.replace("11&", "11&not-an-id&"),
+  ])
+    assert.throws(() => normalize(invalid));
+});
+
 test("SQLite preserves queues, history, uncertain intent and interrupts crashed runs", async () => {
   const t = await temporary();
   let repo = new Repository(t.dir);

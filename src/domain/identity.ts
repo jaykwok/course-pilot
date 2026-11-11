@@ -145,9 +145,13 @@ export function normalize(raw: string): string {
       continue;
     }
     const route = url.hash.split("?")[0];
-    const course = route.match(/^#\/study\/course\/detail\/([\w-]+)(.*)$/);
+    const course = route.match(/^#\/study\/course\/detail\/([^/]+)(.*)$/);
     if (course) {
-      if (!UUID.test(course[1])) throw new Error("平台资源 ID 无效");
+      // Native course links prefix the resource ID with an entrance number.
+      // &0 is the non-preview variant; preview context cannot be reconstructed.
+      const native = course[1].match(/^[1-9]\d*&([0-9a-f-]{36})(?:&0)?$/i);
+      const courseId = native?.[1] || course[1];
+      if (!UUID.test(courseId)) throw new Error("平台资源 ID 无效");
       const suffix = course[2].replace(/\/$/, "");
       const context = suffix.match(/^\/([1-9]\d*)\/([01])\/([\w-]+)$/);
       if (suffix && (!context || !UUID.test(context[3])))
@@ -167,7 +171,7 @@ export function normalize(raw: string): string {
       )
         throw new Error("课程来源参数与路径不一致");
       const source = path.length ? path : query;
-      const base = `${url.origin}/#/study/course/detail/${course[1].toLowerCase()}`;
+      const base = `${url.origin}/#/study/course/detail/${courseId.toLowerCase()}`;
       if (source.every((v) => v === undefined)) return base;
       if (
         !/^[1-9]\d*$/.test(source[0] || "") ||

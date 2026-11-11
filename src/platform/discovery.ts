@@ -167,11 +167,12 @@ export function extractLinks(texts: string[], base: string): string[] {
       /(?:^|\s)(?:href|src|data-url)\s*=\s*["']([^"'<>`\s]+)["']/gi,
     ))
       accept(match[1]);
-    // Remove full URLs first so query-form sources cannot also yield a bare course.
+    // Read whole routes: invalid source tails must not become bare courses.
+    // Remove full URLs first so their sources are validated only once.
     for (const match of text
       .replace(absolute, "")
       .matchAll(
-        /(?:#?\/study\/(?:course|subject)\/detail\/|#?\/exam\/(?:answer-paper|exam-detail)\/|#?\/train-new\/class-detail\/)[0-9a-f-]{36}(?:\/\d+\/[01]\/[0-9a-f-]{36})?(?:\?[^\s"'<>`\\{}()]*)?/gi,
+        /#?\/(?:study\/(?:course|subject)\/detail|exam\/(?:answer-paper|exam-detail)|train-new\/class-detail)\/[^\s"'<>`\\{}()]+/gi,
       ))
       accept(`${PLATFORM}/#${match[0].replace(/^#/, "")}`);
   }
