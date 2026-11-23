@@ -1,70 +1,68 @@
 import {
   Browser,
   ClearSiteDataError,
+  findExecutable,
+  getStartupDiagnostics,
+  ProfileInUseError,
   type BrowserContext,
+  type InputPolicy,
   type Tab,
   type TabScope as BrowserTabScope,
 } from "nodriver-ts";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { prepareProjectProfile } from "./profile.ts";
 import type { Logger } from "../log.ts";
 const loopback = (host: string) =>
   ["127.0.0.1", "localhost", "::1", "[::1]"].includes(host.replace(/^\./, ""));
 
-export function executable(override?: string): string {
-  const candidates = override
-    ? [override]
-    : process.platform === "win32"
-      ? [
-          join(
-            process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)",
-            "Microsoft/Edge/Application/msedge.exe",
-          ),
-          join(
-            process.env.ProgramFiles || "C:\\Program Files",
-            "Microsoft/Edge/Application/msedge.exe",
-          ),
-          join(
-            process.env.LOCALAPPDATA || "",
-            "Microsoft/Edge/Application/msedge.exe",
-          ),
-          join(
-            process.env.ProgramFiles || "C:\\Program Files",
-            "Google/Chrome/Application/chrome.exe",
-          ),
-          join(
-            process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)",
-            "Google/Chrome/Application/chrome.exe",
-          ),
-          join(
-            process.env.LOCALAPPDATA || "",
-            "Google/Chrome/Application/chrome.exe",
-          ),
-        ]
-      : process.platform === "darwin"
-        ? [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-            join(
-              homedir(),
-              "Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            ),
-          ]
-        : [
-            "/usr/bin/google-chrome",
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
-          ];
-  const found = candidates.find((p) => existsSync(p));
-  if (!found)
-    throw new Error(
-      override
-        ? "设置中的浏览器路径不存在，请检查 data/settings.json 的 browser.executable"
-        : "未找到浏览器，请安装 Microsoft Edge 或 Google Chrome",
-    );
-  return found;
+export const FORBIDDEN_CDP = new Set([
+  "Runtime.enable",
+  "Runtime.addBinding",
+  "Console.enable",
+  "Debugger.enable",
+]);
+export function enforceSilentCdp(method: string) {
+  if (FORBIDDEN_CDP.has(method))
+    throw new Error(`拒绝发送静默模式禁用的 CDP 命令：${method}`);
+}
+export const INPUT_POLICY: InputPolicy = {
+  mode: "human",
+  lateMoves: "skip",
+};
+
+export async function executable(override?: string): Promise<string> {
+  if (override) {
+    try {
+      return await findExecutable(override);
+    } catch {
+      throw new Error(
+        "设置中的浏览器路径不存在，请检查 data/settings.json 的 browser.executable",
+      );
+    }
+  }
+  if (!process.env.CHROME_PATH && process.platform === "win32") {
+    const edge = [
+      join(
+        process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)",
+        "Microsoft/Edge/Application/msedge.exe",
+      ),
+      join(
+        process.env.ProgramFiles || "C:\\Program Files",
+        "Microsoft/Edge/Application/msedge.exe",
+      ),
+      join(
+        process.env.LOCALAPPDATA || "",
+        "Microsoft/Edge/Application/msedge.exe",
+      ),
+    ].find((p) => existsSync(p));
+    if (edge) return edge;
+  }
+  try {
+    return await findExecutable();
+  } catch {
+    throw new Error("未找到浏览器，请安装 Microsoft Edge 或 Google Chrome");
+  }
 }
 export class BrowserRuntime {
   readonly browser: Browser;
@@ -104,26 +102,48 @@ export class BrowserRuntime {
     path?: string,
     profileDirectory?: string,
   ) {
-    const browser = await Browser.launch({
-      executablePath: executable(path),
-      userDataDir: profileDirectory,
-      prepareProfile: prepareProjectProfile,
-      inputPolicy: { mode: "human" },
-      headless: false,
-      detached: true,
-      supervised: true,
-      timeout: 30000,
-      preset: "agent",
-      args: [
-        "--disable-background-timer-throttling",
-        "--disable-extensions",
-        "--disable-sync",
-        "--profile-directory=Default",
-        "--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWebRTC,msForceBrowserSignIn,msImplicitSignin,msEdgeOnRampFRE",
-      ],
-      onError: (e) => logger.log(e, "warn"),
-    });
-    return new BrowserRuntime(browser, logger);
+    try {
+      const browser = await Browser.launch({
+        executablePath: await executable(path),
+        userDataDir: profileDirectory,
+        prepareProfile: prepareProjectProfile,
+        inputPolicy: INPUT_POLICY,
+        beforeSend: enforceSilentCdp,
+        headless: false,
+        detached: true,
+        supervised: true,
+        timeout: 30000,
+        preset: "agent",
+        args: [
+          "--disable-background-timer-throttling",
+          "--disable-extensions",
+          "--disable-sync",
+          "--profile-directory=Default",
+          "--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWebRTC,msForceBrowserSignIn,msImplicitSignin,msEdgeOnRampFRE",
+        ],
+        onError: (e) => logger.log(e, "warn"),
+      });
+      return new BrowserRuntime(browser, logger);
+    } catch (error) {
+      const diagnostics = getStartupDiagnostics(error);
+      if (diagnostics) {
+        const proc = diagnostics.process;
+        logger.log(
+          `浏览器启动失败（阶段：${diagnostics.stage}，耗时 ${Math.round(diagnostics.elapsedMs)}ms` +
+            (proc
+              ? `，进程 ${proc.pid ?? "未知"}${proc.exited ? ` 已退出 code=${proc.exitCode} signal=${proc.signal}` : ""}`
+              : "") +
+            "）",
+          "error",
+        );
+      }
+      if (error instanceof ProfileInUseError)
+        logger.log(
+          `浏览器配置目录正被占用：${error.profile}，请先关闭已打开的项目浏览器窗口`,
+          "error",
+        );
+      throw error;
+    }
   }
   static fromBrowser(browser: Browser, logger: Logger) {
     return new BrowserRuntime(browser, logger);

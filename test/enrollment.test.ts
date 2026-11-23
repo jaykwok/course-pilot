@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { Repository } from "../src/storage/repository.ts";
 import { discover, type DiscoveryContext } from "../src/platform/discovery.ts";
 import { entry, normalize, resource } from "../src/domain/identity.ts";
-import { temporary, COURSE } from "./helpers.ts";
+import { temporary, COURSE, SUBJECT } from "./helpers.ts";
 
 const classId = "75c755b8-a236-45e3-b599-fdb54db0ccea";
 const classUrl = resource("class", classId);
@@ -22,6 +22,8 @@ async function fixture(
     detailCode?: number;
     chapters?: { id: string; name: string }[];
     activities?: (url: URL) => { status: number; value: unknown };
+    paasActivities?: (url: URL) => { status: number; value: unknown };
+    subjectChapters?: (url: URL) => { status: number; value: unknown };
   } = {},
 ) {
   const temp = await temporary(),
@@ -112,6 +114,29 @@ async function fixture(
                 "chapters must only be read after verified enrollment",
               );
               chapterReads++;
+              if (
+                path.includes("/subject/chapter-progress") &&
+                options.subjectChapters
+              ) {
+                const result = options.subjectChapters(new URL(requestUrl));
+                return {
+                  status: result.status,
+                  ok: result.status === 200,
+                  body: JSON.stringify(result.value),
+                };
+              }
+              if (
+                (path.endsWith("/chapter-activity-list/paas") ||
+                  path.endsWith("/chapter-activity-list/paas/more")) &&
+                options.paasActivities
+              ) {
+                const result = options.paasActivities(new URL(requestUrl));
+                return {
+                  status: result.status,
+                  ok: result.status === 200,
+                  body: JSON.stringify(result.value),
+                };
+              }
               if (
                 path.endsWith("/chapter-activity-list") &&
                 options.activities
@@ -514,6 +539,177 @@ test("open signup windows enroll while enrolled students can read classes after 
       assert.equal(result.complete, true);
       assert.equal(result.found[0].url, classCourse);
       assert.equal(f.stats().posts, options.status === 5 ? 0 : 1);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+test("class external URL activities (type 11) resolve businessValue via PAAS and expand linked subjects", async () => {
+  const subjectId = entry(SUBJECT, "a").businessId;
+  const linkedCourseId = "99999999-9999-4999-8999-999999999999";
+  const qrSubject = `https://kc.zhixueyun.com/app/wechat/#/qrScan?businessType=2&businessId=${subjectId}&isThirdUrl=1`;
+  const paasRequests: string[] = [];
+  const f = await fixture({
+    status: 5,
+    activities() {
+      return {
+        status: 200,
+        value: {
+          items: [
+            {
+              id: "ext-1",
+              businessType: 11,
+              businessId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+              required: 0,
+              classStudentActivityProgress: { finishStatus: 1, status: 4 },
+            },
+            {
+              id: "course-1",
+              businessType: 8,
+              businessId: entry(COURSE, "a").businessId,
+              required: 1,
+            },
+            ...Array.from({ length: 4 }, (_, i) => activity(i + 10)),
+            {
+              id: "ext-2",
+              businessType: 11,
+              businessId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+              required: 0,
+              classStudentActivityProgress: { finishStatus: 0, status: 0 },
+            },
+          ],
+          recordCount: 7,
+        },
+      };
+    },
+    paasActivities(url) {
+      paasRequests.push(`${url.pathname}?page=${url.searchParams.get("page")}`);
+      const page = Number(url.searchParams.get("page"));
+      if (page === 1)
+        return {
+          status: 200,
+          value: {
+            items: [
+              { id: "ext-1", businessType: 11, businessValue: qrSubject },
+              { id: "course-1", businessType: 8, businessValue: "" },
+              ...Array.from({ length: 3 }, (_, i) => activity(i + 10)),
+            ],
+            recordCount: 5,
+          },
+        };
+      return {
+        status: 200,
+        value: {
+          items: [
+            activity(13),
+            {
+              id: "ext-2",
+              businessType: 11,
+              businessValue: "https://outside.example/notice",
+            },
+          ],
+          recordCount: 0,
+        },
+      };
+    },
+    subjectChapters(url) {
+      assert.equal(url.searchParams.get("courseId"), subjectId);
+      return {
+        status: 200,
+        value: [
+          {
+            courseChapterSections: [
+              { sectionType: 10, attachmentId: linkedCourseId, required: 1 },
+            ],
+          },
+        ],
+      };
+    },
+  });
+  try {
+    const result = await discover([classUrl], f.ctx);
+    assert.equal(result.complete, true);
+    assert.deepEqual(paasRequests, [
+      "/api/v1/training/student/class-info/safe/chapter-activity-list/paas?page=1",
+      "/api/v1/training/student/class-info/safe/chapter-activity-list/paas/more?page=2",
+    ]);
+    const urls = result.found.map((t) => t.url);
+    assert.ok(urls.includes(classCourse));
+    assert.ok(urls.includes(`${resource("course", linkedCourseId, subjectId, 1)}`));
+    const edge = f.repo.db
+      .prepare("SELECT required FROM edges WHERE parent=? AND child=?")
+      .get(f.repo.upsert(classUrl, "a").id, f.repo.upsert(SUBJECT, "a").id);
+    assert.equal(edge?.required, 0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("unfinished required class external URL activities still queue linked courses and stay blocked, while PAAS failures remain retryable", async () => {
+  const subjectId = entry(SUBJECT, "a").businessId;
+  const linkedCourseId = "88888888-8888-4888-8888-888888888888";
+  for (const paasDown of [false, true]) {
+    const f = await fixture({
+      status: 5,
+      activities() {
+        return {
+          status: 200,
+          value: {
+            items: [
+              {
+                id: "ext-req",
+                businessType: 11,
+                required: 1,
+                classStudentActivityProgress: { finishStatus: 0, status: 0 },
+              },
+              {
+                id: "course-1",
+                businessType: 8,
+                businessId: entry(COURSE, "a").businessId,
+                required: 1,
+              },
+            ],
+            recordCount: 2,
+          },
+        };
+      },
+      paasActivities() {
+        if (paasDown) return { status: 500, value: { message: "server error" } };
+        return {
+          status: 200,
+          value: {
+            items: [{ id: "ext-req", businessType: 11, businessValue: SUBJECT }],
+            recordCount: 2,
+          },
+        };
+      },
+      subjectChapters() {
+        return {
+          status: 200,
+          value: [
+            {
+              courseChapterSections: [
+                { sectionType: 10, attachmentId: linkedCourseId, required: 1 },
+              ],
+            },
+          ],
+        };
+      },
+    });
+    try {
+      const result = await discover([classUrl], f.ctx);
+      assert.equal(result.complete, false);
+      assert.equal(result.issues[0].recovery, paasDown ? "retry" : "blocked");
+      assert.ok(result.found.some((t) => t.url === classCourse));
+      assert.equal(
+        result.found.some(
+          (t) => t.url === resource("course", linkedCourseId, subjectId, 1),
+        ),
+        !paasDown,
+      );
+      if (!paasDown)
+        assert.match(result.issues[0].message, /必修外链活动尚未在平台确认完成/);
     } finally {
       await f.close();
     }

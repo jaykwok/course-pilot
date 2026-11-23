@@ -1,4 +1,4 @@
-import { InputActionError, type Tab } from "nodriver-ts";
+import { InputActionError, StaleElementError, type Tab } from "nodriver-ts";
 import { PLATFORM } from "../config.ts";
 import {
   entry,
@@ -140,11 +140,11 @@ export function extractLinks(texts: string[], base: string): string[] {
         return;
       if (raw.startsWith("#") && !raw.startsWith("#/")) return;
       if (
-        /^#?\/(?:study\/(?:course|subject)\/detail|exam\/(?:answer-paper|exam-detail)|train-new\/class-detail)\//i.test(
+        /^(?:\/#|#)?\/(?:study\/(?:course|subject)\/(?:detail|preview)|exam\/(?:exam\/)?(?:answer-paper|exam-detail)|train-new\/(?:class-detail(?:-preview)?|class-preview))\//i.test(
           raw,
         )
       )
-        raw = `${PLATFORM}/#${raw.replace(/^#/, "")}`;
+        raw = `${PLATFORM}/#${raw.replace(/^(?:\/#|#)/, "")}`;
       const url = normalize(new URL(raw, base).href);
       if (isPlaceholderEntry(url)) return;
       const parsed = new URL(url);
@@ -172,9 +172,9 @@ export function extractLinks(texts: string[], base: string): string[] {
     for (const match of text
       .replace(absolute, "")
       .matchAll(
-        /#?\/(?:study\/(?:course|subject)\/detail|exam\/(?:answer-paper|exam-detail)|train-new\/class-detail)\/[^\s"'<>`\\{}()]+/gi,
+        /(?:\/#|#)?\/(?:study\/(?:course|subject)\/(?:detail|preview)|exam\/(?:exam\/)?(?:answer-paper|exam-detail)|train-new\/(?:class-detail(?:-preview)?|class-preview))\/[^\s"'<>`\\{}()]+/gi,
       ))
-      accept(`${PLATFORM}/#${match[0].replace(/^#/, "")}`);
+      accept(`${PLATFORM}/#${match[0].replace(/^(?:\/#|#)/, "")}`);
   }
   return [...links];
 }
@@ -671,18 +671,30 @@ async function classManifest(
   if (!chapters.length)
     return { links: [], complete: false, message: "培训班章节清单为空" };
   const links: string[] = [];
+  const optionalLinks: string[] = [];
+  const requiredLinks = new Set<string>();
   const problems: { message: string; recovery: Recovery }[] = [];
+  const decodeActivityUrl = (raw: string) => {
+    const trimmed = raw.trim();
+    try {
+      new URL(trimmed);
+      return trimmed;
+    } catch {
+      return decodeURIComponent(trimmed);
+    }
+  };
   for (const chapter of chapters) {
     const label = `章节「${chapter.name || chapter.id || "缺少 ID"}」`;
+    if (!UUID.test(String(chapter.id))) {
+      problems.push({ message: `${label}：章节 ID 无效`, recovery: "retry" });
+      continue;
+    }
     let page = 1;
+    const seen = new Set<string>();
+    const chapterItems: { key: string; page: number; item: any }[] = [];
+    let expected: number | undefined;
     try {
-      if (!UUID.test(String(chapter.id))) {
-        problems.push({ message: `${label}：章节 ID 无效`, recovery: "retry" });
-        continue;
-      }
-      const seen = new Set<string>();
       let ended = false;
-      let expected: number | undefined;
       for (; page <= 200; page++) {
         // The standard list exposes the total; the PAAS preview/more endpoints
         // report a preview count and zero respectively, not the chapter total.
@@ -703,30 +715,7 @@ async function classManifest(
           if (seen.has(key)) continue;
           seen.add(key);
           added++;
-          try {
-            if (item.businessValue) {
-              const value = normalize(decodeURIComponent(item.businessValue));
-              links.push(value);
-            } else if (String(item.businessType) === "8")
-              links.push(
-                normalize(
-                  `${resource("course", item.businessId)}/5/${item.required}/${task.businessId}`,
-                ),
-              );
-            else if (["1", "7", "9"].includes(String(item.businessType)))
-              links.push(resource("exam", item.businessId));
-            else
-              throw new ReviewRequired(
-                "class_activity_manual",
-                `活动类型 ${item.businessType} 需要在平台处理`,
-                "blocked",
-              );
-          } catch (error) {
-            problems.push({
-              message: `${label}第 ${page} 页，活动 ${item.id || key}：${error instanceof Error ? error.message : String(error)}`,
-              recovery: failureRecovery(error),
-            });
-          }
+          chapterItems.push({ key, page, item });
         }
         if (
           !Number.isSafeInteger(payload.recordCount) ||
@@ -761,9 +750,133 @@ async function classManifest(
         recovery: failureRecovery(e),
       });
     }
+    // External URL activities (businessType 11) omit businessValue on the
+    // standard chapter-activity-list endpoint; fetch the PAAS list on demand.
+    const missingExternal = new Set(
+      chapterItems
+        .filter(
+          ({ item }) =>
+            String(item.businessType) === "11" &&
+            !(
+              typeof item.businessValue === "string" &&
+              item.businessValue.trim()
+            ),
+        )
+        .map(({ key }) => key),
+    );
+    const paasValues = new Map<string, string>();
+    let paasError: unknown;
+    if (missingExternal.size) {
+      try {
+        const paasSeen = new Set<string>();
+        for (
+          let paasPage = 1;
+          paasPage <= 200 && paasValues.size < missingExternal.size;
+          paasPage++
+        ) {
+          const endpoint =
+            paasPage === 1
+              ? `${prefix}/chapter-activity-list/paas?classId=${task.businessId}&chapterId=${chapter.id}&page=1&pageSize=5`
+              : `${prefix}/chapter-activity-list/paas/more?classId=${task.businessId}&chapterId=${chapter.id}&page=${paasPage}&pageSize=5`;
+          const items = list(await http.json(endpoint));
+          let added = 0;
+          for (const item of items) {
+            const key = String(item?.id || "");
+            if (!key || paasSeen.has(key)) continue;
+            paasSeen.add(key);
+            added++;
+            if (
+              missingExternal.has(key) &&
+              typeof item.businessValue === "string" &&
+              item.businessValue.trim()
+            )
+              paasValues.set(key, item.businessValue);
+          }
+          if (!added || (expected !== undefined && paasSeen.size >= expected))
+            break;
+        }
+      } catch (e) {
+        if (ctx.lease.signal.aborted || e instanceof AuthenticationError)
+          throw e;
+        paasError = e;
+      }
+    }
+    for (const { key, page: itemPage, item } of chapterItems) {
+      try {
+        if (String(item.businessType) === "11") {
+          const raw =
+            (typeof item.businessValue === "string" &&
+              item.businessValue.trim()) ||
+            paasValues.get(key) ||
+            "";
+          if (!raw) {
+            if (paasError) throw paasError;
+            throw new ReviewRequired(
+              "class_activity_manual",
+              "外链活动缺少跳转地址，需要在平台处理",
+              "blocked",
+            );
+          }
+          const destination = new URL(decodeActivityUrl(raw));
+          if (
+            !["http:", "https:"].includes(destination.protocol) ||
+            destination.username ||
+            destination.password
+          )
+            throw new Error("培训班外链地址无效");
+          if (
+            platformHost(destination.hostname) ||
+            isCasePoolUrl(destination)
+          ) {
+            const destinations = extractLinks([destination.href], task.url);
+            optionalLinks.push(
+              ...destinations.filter((url) => !links.includes(url)),
+            );
+            links.push(...destinations);
+          }
+          const completed =
+            String(item.classStudentActivityProgress?.finishStatus) === "1";
+          if (String(item.required) !== "0" && !completed)
+            throw new ReviewRequired(
+              "class_activity_manual",
+              "必修外链活动尚未在平台确认完成，请在平台打开",
+              "blocked",
+            );
+        } else if (item.businessValue) {
+          const value = normalize(
+            decodeActivityUrl(String(item.businessValue)),
+          );
+          links.push(value);
+          if (String(item.required) === "0") optionalLinks.push(value);
+          else requiredLinks.add(value);
+        } else if (String(item.businessType) === "8") {
+          const url = normalize(
+            `${resource("course", item.businessId)}/5/${item.required}/${task.businessId}`,
+          );
+          links.push(url);
+          if (String(item.required) !== "0") requiredLinks.add(url);
+        } else if (["1", "7", "9"].includes(String(item.businessType))) {
+          const url = resource("exam", item.businessId);
+          links.push(url);
+          if (String(item.required) === "0") optionalLinks.push(url);
+          else requiredLinks.add(url);
+        } else
+          throw new ReviewRequired(
+            "class_activity_manual",
+            `活动类型 ${item.businessType} 需要在平台处理`,
+            "blocked",
+          );
+      } catch (error) {
+        problems.push({
+          message: `${label}第 ${itemPage} 页，活动 ${item.id || key}：${error instanceof Error ? error.message : String(error)}`,
+          recovery: failureRecovery(error),
+        });
+      }
+    }
   }
   return {
     links,
+    optionalLinks: optionalLinks.filter((url) => !requiredLinks.has(url)),
     complete: problems.length === 0,
     message: problems.length
       ? `培训班活动解析未完成：${problems.map((problem) => problem.message).join("；")}`
@@ -852,20 +965,43 @@ async function expandCatalog(tab: Tab, ctx: DiscoveryContext) {
     timeout: 5000,
     signal: ctx.lease.signal,
   })) {
-    const candidate = await element.evaluate((e) => {
-      const link = e.closest("a[href],[onclick],[data-url]");
-      return {
-        text: (e.innerText || e.textContent || "").replace(/\s/g, ""),
-        disabled:
-          e.hasAttribute("disabled") ||
-          e.getAttribute("aria-disabled") === "true",
-        href: link?.getAttribute("href") || "",
-        values: ["href", "onclick", "data-url"].map(
-          (a) => link?.getAttribute(a) || "",
-        ),
-      };
-    });
+    let candidate;
+    try {
+      candidate = await element.evaluate(
+        (e) => {
+          const text = (e.innerText || e.textContent || "").replace(/\s/g, "");
+          const link = e.closest("a[href],[onclick],[data-url]");
+          const nested = [...e.querySelectorAll("a,button,span,div,li")].some(
+            (child) =>
+              child.getBoundingClientRect().height > 0 &&
+              getComputedStyle(child).visibility !== "hidden" &&
+              (
+                (child as HTMLElement).innerText ||
+                child.textContent ||
+                ""
+              ).replace(/\s/g, "") === text,
+          );
+          return {
+            text,
+            nested,
+            disabled:
+              e.matches(":disabled") ||
+              e.getAttribute("aria-disabled") === "true",
+            href: link?.getAttribute("href") || "",
+            values: ["href", "onclick", "data-url"].map(
+              (a) => link?.getAttribute(a) || "",
+            ),
+          };
+        },
+        undefined,
+        { timeout: 3000, signal: ctx.lease.signal },
+      );
+    } catch (e) {
+      if (e instanceof StaleElementError) continue;
+      throw e;
+    }
     if (
+      candidate.nested ||
       !["查看更多", "加载更多", "更多", "展开更多", "显示更多"].includes(
         candidate.text,
       ) ||

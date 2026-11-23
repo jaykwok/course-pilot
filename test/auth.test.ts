@@ -1,7 +1,14 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { TimeoutError, type Tab } from "nodriver-ts";
+import {
+  DisconnectedError,
+  ProtocolError,
+  SessionEndedError,
+  TimeoutError,
+  type Tab,
+} from "nodriver-ts";
+import { applyLoginPreferences } from "../src/browser/login.ts";
 import { application } from "./helpers.ts";
 import { atomicJson } from "../src/storage/files.ts";
 import { CENTER, HOME } from "../src/config.ts";
@@ -195,4 +202,46 @@ test("revoked credentials update the dashboard until verified again", async (t) 
   } finally {
     await f.close();
   }
+});
+
+test("login preferences ignore transient context loss and OOPIF SessionEndedError, but propagate DisconnectedError", async () => {
+  const signal = new AbortController().signal;
+  const tab = {
+    closed: false,
+    frames: [
+      {
+        detached: false,
+        async queryAll() {
+          throw new ProtocolError(
+            "Runtime.evaluate",
+            -32000,
+            "Inspected target navigated or closed",
+          );
+        },
+      },
+      {
+        detached: false,
+        async queryAll() {
+          throw new SessionEndedError("detached", "login-iframe");
+        },
+      },
+    ],
+  } as unknown as Tab;
+  await applyLoginPreferences(tab, signal);
+
+  const disconnected = {
+    closed: false,
+    frames: [
+      {
+        detached: false,
+        async queryAll() {
+          throw new DisconnectedError("connection lost");
+        },
+      },
+    ],
+  } as unknown as Tab;
+  await assert.rejects(
+    applyLoginPreferences(disconnected, signal),
+    DisconnectedError,
+  );
 });

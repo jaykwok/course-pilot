@@ -145,16 +145,23 @@ export function normalize(raw: string): string {
       continue;
     }
     const route = url.hash.split("?")[0];
-    const course = route.match(/^#\/study\/course\/detail\/([^/]+)(.*)$/);
+    const course = route.match(/^#\/study\/course\/(detail|preview)\/([^/]+)(.*)$/i);
     if (course) {
+      const mode = course[1].toLowerCase();
       // Native course links prefix the resource ID with an entrance number.
       // &0 is the non-preview variant; preview context cannot be reconstructed.
-      const native = course[1].match(/^[1-9]\d*&([0-9a-f-]{36})(?:&0)?$/i);
-      const courseId = native?.[1] || course[1];
+      const rawId = course[2].replace(/&lang=[ce]n$/i, "");
+      const native = rawId.match(/^[1-9]\d*(?:&|@@)([0-9a-f-]{36})(?:&0)?$/i);
+      const courseId = native?.[1] || rawId;
       if (!UUID.test(courseId)) throw new Error("平台资源 ID 无效");
-      const suffix = course[2].replace(/\/$/, "");
+      const suffix = course[3].replace(/\/$/, "");
       const context = suffix.match(/^\/([1-9]\d*)\/([01])\/([\w-]+)$/);
-      if (suffix && (!context || !UUID.test(context[3])))
+      const previewQualifier =
+        mode === "preview" &&
+        /^\/(?:share|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d{6,})$/i.test(
+          suffix,
+        );
+      if (suffix && !previewQualifier && (!context || !UUID.test(context[3])))
         throw new Error("课程来源或必修标记不完整");
       const query = [
         get("type"),
@@ -180,6 +187,44 @@ export function normalize(raw: string): string {
       )
         throw new Error("课程来源或必修标记不完整");
       return `${base}/${source[0]}/${source[1]}/${source[2]!.toLowerCase()}`;
+    }
+    const subject = route.match(
+      /^#\/study\/subject\/(detail|preview)\/([^/]+)(.*)$/i,
+    );
+    if (subject) {
+      const mode = subject[1].toLowerCase();
+      const rawId = subject[2].replace(/&lang=[ce]n$/i, "");
+      const prefixed = rawId.match(/^[1-9]\d*(?:&|@@)([0-9a-f-]{36})$/i);
+      const subjectId = prefixed?.[1] || rawId;
+      if (!UUID.test(subjectId)) throw new Error("平台资源 ID 无效");
+      const suffix = subject[3].replace(/\/$/, "");
+      const previewQualifier =
+        mode === "preview" && /^\/(?:share|\d+)$/i.test(suffix);
+      if (suffix && !previewQualifier) throw new Error("专题链接格式不完整");
+      return `${url.origin}/#/study/subject/detail/${subjectId.toLowerCase()}`;
+    }
+    const trainClass = route.match(
+      /^#\/train-new\/(class-detail(?:-preview)?|class-preview)\/([^/]+)(.*)$/i,
+    );
+    if (trainClass) {
+      const rawId = trainClass[2].replace(/&lang=[ce]n$/i, "");
+      const prefixed = rawId.match(/^[1-9]\d*@@([0-9a-f-]{36})$/i);
+      const classIdFromRoute = prefixed?.[1] || rawId;
+      if (!UUID.test(classIdFromRoute)) throw new Error("平台资源 ID 无效");
+      if (trainClass[3].replace(/\/$/, ""))
+        throw new Error("培训班链接格式不完整");
+      return `${url.origin}/#/train-new/class-detail/${classIdFromRoute.toLowerCase()}`;
+    }
+    const exam = route.match(
+      /^#\/exam\/(?:exam\/)?(answer-paper|exam-detail)\/([^/]+)(.*)$/i,
+    );
+    if (exam) {
+      const rawId = exam[2].replace(/&lang=[ce]n$/i, "");
+      const prefixed = rawId.match(/^[1-9]\d*@@([0-9a-f-]{36})$/i);
+      const examId = prefixed?.[1] || rawId;
+      if (!UUID.test(examId)) throw new Error("平台资源 ID 无效");
+      if (exam[3].replace(/\/$/, "")) throw new Error("考试链接格式不完整");
+      return `${url.origin}/#/exam/answer-paper/${examId.toLowerCase()}`;
     }
     const classId = get("classid");
     if (classId !== undefined) return resource("class", classId);

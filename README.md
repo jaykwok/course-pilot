@@ -212,7 +212,7 @@ flowchart TD
 
 ## 开发与检查
 
-浏览器层直接使用 `nodriver-ts@0.9.1`：`goto()` 处理连续 SSO 跳转，`TabScope.borrow()` 复用启动页并回收本轮弹窗，`prepareProfile` 在库持有 profile 锁时初始化项目设置。平台请求使用可取消的浏览器 `fetch()`；动态章节使用 `Locator`，原生选项使用 `setChecked()`。账号核验、平台 token、业务错误翻译和写请求重试规则由本项目管理，不提供旧版 nodriver 接口兼容。
+浏览器层直接使用 `nodriver-ts@1.1.1`：`findExecutable()` 查找浏览器（Windows 仍优先 Edge 以复用既有配置目录），`beforeSend` 在发包前强制阻断静默模式禁用的 CDP 域，`inputPolicy` 启用 `human` 与 `lateMoves: "skip"` 并结合内置 `presentationRecovery` 应对后台/最小化窗口，`goto()` 处理连续 SSO 跳转，`TabScope.borrow()` 复用启动页并回收本轮弹窗，`prepareProfile` 在库持有 profile 锁时初始化项目设置，启动失败通过 `getStartupDiagnostics()` 记录阶段诊断，登录与案例库轮询通过 `isContextGone()` / `SessionEndedError` 区分瞬态 iframe 切换与整条连接断开。平台请求使用可取消的浏览器 `fetch()`；动态章节使用 `Locator`，原生选项使用 `setChecked()`，元素读取统一传入超时与取消信号。账号核验、平台 token、业务错误翻译和写请求重试规则由本项目管理，不提供旧版 nodriver 接口兼容。
 
 ```sh
 npm run check

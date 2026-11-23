@@ -9,8 +9,14 @@ import {
 import { application, temporary } from "./helpers.ts";
 import { atomicJson } from "../src/storage/files.ts";
 import { accountId } from "../src/domain/identity.ts";
-import { Browser, ClearSiteDataError } from "nodriver-ts";
-import { BrowserRuntime } from "../src/browser/runtime.ts";
+import { Browser, ClearSiteDataError, ProfileInUseError } from "nodriver-ts";
+import {
+  BrowserRuntime,
+  enforceSilentCdp,
+  executable,
+  FORBIDDEN_CDP,
+  INPUT_POLICY,
+} from "../src/browser/runtime.ts";
 import { Logger } from "../src/log.ts";
 import type { Protocol } from "devtools-protocol";
 import { NO_REPLY } from "nodriver-ts/testing";
@@ -67,7 +73,8 @@ test("persistent browser launch stays visible, disables extensions and retains i
       assert.ok(options.args.includes("--disable-extensions"));
       assert.ok(options.args.includes("--disable-sync"));
       assert.ok(!options.args.includes("--no-sandbox"));
-      assert.deepEqual(options.inputPolicy, { mode: "human" });
+      assert.deepEqual(options.inputPolicy, INPUT_POLICY);
+      assert.equal(options.beforeSend, enforceSilentCdp);
       await options.prepareProfile(dir, { empty: true, temporary: false });
       return f.browser;
     });
@@ -419,5 +426,58 @@ test("credential content changes invalidate the lease even when metadata is unch
     assert.throws(() => f.app.auth.assert(lease), /凭证或账号/);
   } finally {
     await f.close();
+  }
+});
+
+test("beforeSend blocks forbidden CDP commands before touching the wire", async () => {
+  const f = await application();
+  try {
+    const before = f.chrome.commands.length;
+    for (const method of FORBIDDEN_CDP) {
+      await assert.rejects(
+        f.browser.cdp.send(method as any),
+        /拒绝发送静默模式禁用的 CDP 命令/,
+      );
+    }
+    assert.equal(f.chrome.commands.length, before);
+    assert.equal(f.browser.connection.unansweredCount, 0);
+    f.chrome.assertDone();
+  } finally {
+    await f.close();
+  }
+});
+
+test("executable delegates override validation to findExecutable and reports clear errors", async () => {
+  assert.equal(await executable(process.execPath), process.execPath);
+  await assert.rejects(
+    executable(join(process.cwd(), "nonexistent-browser-binary-for-test")),
+    /browser\.executable/,
+  );
+});
+
+test("BrowserRuntime.launch logs ProfileInUseError diagnostics before rethrowing", async (t) => {
+  const temp = await temporary();
+  try {
+    const dir = join(temp.dir, "browser-profile");
+    const logger = new Logger(join(temp.dir, "logs"));
+    const logged: { message: string; level: string }[] = [];
+    logger.listener = (message, level) => logged.push({ message, level });
+    t.mock.method(Browser, "launch", async () => {
+      throw new ProfileInUseError(dir, "profile already locked");
+    });
+    await assert.rejects(
+      BrowserRuntime.launch(logger, process.execPath, dir),
+      ProfileInUseError,
+    );
+    assert.ok(
+      logged.some(
+        (entry) =>
+          entry.level === "error" &&
+          entry.message.includes("浏览器配置目录正被占用") &&
+          entry.message.includes(dir),
+      ),
+    );
+  } finally {
+    await temp.close();
   }
 });

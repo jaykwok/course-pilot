@@ -100,6 +100,77 @@ test("native course entrance links retain source identity when pasted or dedupli
     assert.throws(() => normalize(invalid));
 });
 
+test("preview and platform alias routes normalize to canonical resource identities", () => {
+  const courseId = entry(COURSE, "a").businessId;
+  const subjectId = entry(SUBJECT, "a").businessId;
+  const examId = entry(EXAM, "a").businessId;
+  const classId = "75c755b8-a236-45e3-b599-fdb54db0ccea";
+  const classCanonical = resource("class", classId);
+  const sourced = `${COURSE}/5/1/${classId}`;
+
+  for (const url of [
+    `https://kc.zhixueyun.com/#/study/course/preview/${courseId}`,
+    `https://kc.zhixueyun.com/#/study/course/preview/${courseId}/`,
+    `https://kc.zhixueyun.com/#/study/course/preview/${courseId}/share`,
+    `https://kc.zhixueyun.com/#/study/course/preview/${courseId}/${examId}`,
+    `https://kc.zhixueyun.com/#/study/course/preview/${courseId}/1234567890`,
+    `https://kc.zhixueyun.com/#/study/course/preview/11&${courseId}`,
+    `https://kc.zhixueyun.com/#/study/course/detail/11@@${courseId}&lang=cn`,
+  ]) {
+    assert.equal(normalize(url), COURSE, url);
+    assert.equal(entry(url, "a").kind, "course", url);
+    assert.equal(entry(url, "a").id, entry(COURSE, "a").id, url);
+  }
+  for (const url of [
+    `https://kc.zhixueyun.com/#/study/course/preview/${courseId}/5/1/${classId}`,
+    `https://kc.zhixueyun.com/#/study/course/preview/${courseId}?type=5&required=1&sourceId=${classId}`,
+    `https://kc.zhixueyun.com/#/study/course/detail/11@@${courseId}/5/1/${classId}`,
+  ]) {
+    assert.equal(normalize(url), sourced, url);
+    assert.equal(entry(url, "a").id, entry(sourced, "a").id, url);
+  }
+  for (const url of [
+    `https://kc.zhixueyun.com/#/study/subject/preview/${subjectId}`,
+    `https://kc.zhixueyun.com/#/study/subject/preview/${subjectId}/1`,
+    `https://kc.zhixueyun.com/#/study/subject/preview/${subjectId}/share`,
+    `https://kc.zhixueyun.com/#/study/subject/detail/99@@${subjectId}&lang=cn`,
+  ]) {
+    assert.equal(normalize(url), SUBJECT, url);
+    assert.equal(entry(url, "a").kind, "subject", url);
+    assert.equal(entry(url, "a").id, entry(SUBJECT, "a").id, url);
+  }
+  for (const url of [
+    `https://kc.zhixueyun.com/#/train-new/class-detail-preview/${classId}`,
+    `https://kc.zhixueyun.com/#/train-new/class-detail-preview/99@@${classId}`,
+    `https://kc.zhixueyun.com/#/train-new/class-preview/${classId}`,
+    `https://kc.zhixueyun.com/#/train-new/class-detail/99@@${classId}`,
+  ]) {
+    assert.equal(normalize(url), classCanonical, url);
+    assert.equal(entry(url, "a").kind, "class", url);
+    assert.equal(entry(url, "a").id, entry(classCanonical, "a").id, url);
+  }
+  for (const url of [
+    `https://kc.zhixueyun.com/#/exam/exam/answer-paper/${examId}`,
+    `https://kc.zhixueyun.com/#/exam/exam/exam-detail/${examId}`,
+    `https://kc.zhixueyun.com/#/exam/answer-paper/99@@${examId}`,
+  ]) {
+    assert.equal(normalize(url), EXAM, url);
+    assert.equal(entry(url, "a").kind, "exam", url);
+    assert.equal(entry(url, "a").id, entry(EXAM, "a").id, url);
+  }
+  for (const invalid of [
+    `https://kc.zhixueyun.com/#/study/course/preview/not-a-uuid`,
+    `https://kc.zhixueyun.com/#/study/course/preview/${courseId}/5`,
+    `https://kc.zhixueyun.com/#/study/course/preview/${courseId}/5/1/broken`,
+    `https://kc.zhixueyun.com/#/study/course/preview/${courseId}?sourceId=broken`,
+    `https://kc.zhixueyun.com/#/study/subject/preview/not-a-uuid`,
+    `https://kc.zhixueyun.com/#/study/subject/detail/${subjectId}/extra`,
+    `https://kc.zhixueyun.com/#/train-new/class-detail-preview/not-a-uuid`,
+    `https://kc.zhixueyun.com/#/exam/exam/answer-paper/not-a-uuid`,
+  ])
+    assert.throws(() => normalize(invalid), invalid);
+});
+
 test("SQLite preserves queues, history, uncertain intent and interrupts crashed runs", async () => {
   const t = await temporary();
   let repo = new Repository(t.dir);

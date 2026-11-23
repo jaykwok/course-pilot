@@ -1,7 +1,7 @@
 import { ActionabilityError, InputActionError, type Tab } from "nodriver-ts";
 import type { Configuration } from "../config.ts";
 import type { Task } from "../storage/repository.ts";
-import { resource } from "../domain/identity.ts";
+import { entry, resource } from "../domain/identity.ts";
 import { PlatformHttp } from "../browser/http.ts";
 import {
   data,
@@ -152,7 +152,11 @@ async function rating(tab: Tab, ctx: DiscoveryContext) {
       timeout: 3000,
       signal: ctx.lease.signal,
     }))
-      if ((await button.text()).replace(/\s/g, "") === "确定") {
+      if (
+        (
+          await button.text({ timeout: 3000, signal: ctx.lease.signal })
+        ).replace(/\s/g, "") === "确定"
+      ) {
         await button.click({
           signal: ctx.lease.signal,
           timeout: 5000,
@@ -262,6 +266,24 @@ export async function learn(
 ) {
   if (task.kind !== "course") {
     await discover([task.url], ctx);
+    if (task.kind === "entry") {
+      let canonical;
+      try {
+        if (entry(task.url, task.account).id !== task.id)
+          canonical = ctx.repo.upsert(task.url, task.account);
+      } catch {}
+      if (canonical && canonical.id !== task.id) {
+        for (const row of ctx.repo.db
+          .prepare("SELECT parent,required FROM edges WHERE child=?")
+          .all(task.id))
+          ctx.repo.link(
+            ctx.repo.task(String(row.parent)),
+            canonical,
+            !!row.required,
+          );
+        ctx.repo.discardEntry(task, "入口已规范化为直接学习资源");
+      }
+    }
     if (
       task.kind === "subject" &&
       !ctx.repo.hasFailure(task.id) &&

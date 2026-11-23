@@ -14,7 +14,6 @@ import {
   TimeoutError,
   StaleElementError,
   type Tab,
-  type InputReport,
 } from "nodriver-ts";
 import type { DiscoveryContext } from "../src/platform/discovery.ts";
 import {
@@ -24,7 +23,7 @@ import {
   downloadFile,
 } from "../src/platform/references.ts";
 import { entry } from "../src/domain/identity.ts";
-import { COURSE, EXAM } from "./helpers.ts";
+import { COURSE, EXAM, inputReport } from "./helpers.ts";
 import { accessProblem, clickPlayerControl } from "../src/platform/dom.ts";
 import type { Element as BrowserElement } from "nodriver-ts";
 
@@ -79,19 +78,7 @@ test("chapter activation reacquires replaced rows but never replays partially di
     let lookups = 0,
       focused = false;
     const abort = new AbortController();
-    const report: InputReport = {
-      action: "click",
-      status: "interrupted",
-      seed: 1,
-      randomState: 1,
-      completedSegments: 0,
-      events: 1,
-      dispatched,
-      trace: [],
-      cleanupErrors: [],
-      phase: "done",
-      cleanup: "completed",
-    };
+    const report = inputReport({ events: 1, dispatched });
     const failure = new InputActionError(
       report,
       new StaleElementError("Element was removed from its document"),
@@ -161,19 +148,10 @@ test("chapter layout movement is repositioned once only before any press was dis
       hovers = 0,
       focused = false,
       cleaned = false;
-    const report: InputReport = {
-      action: "click",
-      status: "interrupted",
-      seed: 1,
-      randomState: 1,
-      completedSegments: 0,
+    const report = inputReport({
       events: 52,
       dispatched: mode === "pressed" ? 1 : 0,
-      trace: [],
-      cleanupErrors: [],
-      phase: "done",
-      cleanup: "completed",
-    };
+    });
     const failure = new InputActionError(
       report,
       mode === "timeout"

@@ -9,14 +9,14 @@ import {
   catalogPageState,
   catalogManifest,
 } from "../src/platform/discovery.ts";
-import { temporary, COURSE, EXAM, SUBJECT } from "./helpers.ts";
+import { temporary, COURSE, EXAM, SUBJECT, inputReport } from "./helpers.ts";
 import { entry, CASE_POOL, normalize } from "../src/domain/identity.ts";
 import { runInNewContext } from "node:vm";
 import { learn } from "../src/platform/learning.ts";
 import type { DiscoveryContext } from "../src/platform/discovery.ts";
 import { configuration } from "../src/config.ts";
 import { HOME } from "../src/config.ts";
-import { InputActionError, type Tab } from "nodriver-ts";
+import { InputActionError, StaleElementError, type Tab } from "nodriver-ts";
 import { ReviewRequired } from "../src/utils.ts";
 
 const snapshot = (url: string, values: string[], extra = {}) => ({
@@ -333,27 +333,15 @@ test("missing-page evidence is pruned, but a course mentioning file not found is
 test("failed native expansion preserves collected courses and waits for input cleanup", async () => {
   const root = "https://cms.mylearning.cn/topic/expand.html";
   let cleaned = false;
-  const report = {
-    action: "click",
-    status: "interrupted",
-    seed: 1,
-    randomState: 1,
-    completedSegments: 0,
-    events: 0,
-    dispatched: 0,
-    trace: [],
-    cleanupErrors: [],
-    phase: "done",
-    cleanup: "completed",
-  } as const;
+  const report = inputReport();
   const failure = new InputActionError(
-    { ...report, trace: [], cleanupErrors: [] },
+    report,
     new Error("target moved"),
     Promise.resolve().then(() => {
       cleaned = true;
       return {
         status: "completed",
-        report: { ...report, trace: [], cleanupErrors: [] },
+        report,
       };
     }),
   );
@@ -1181,5 +1169,178 @@ test("subject uses resource IDs and required source identity; unknown sections s
   } finally {
     r.close();
     await t.close();
+  }
+});
+
+test("preview links in HTML and scripts resolve to canonical resources without opening a catalog tab", async () => {
+  const root = "https://cms.mylearning.cn/topic/project/pc.html";
+  const courseId = entry(COURSE, "a").businessId;
+  const subjectId = entry(SUBJECT, "a").businessId;
+  const classId = "75c755b8-a236-45e3-b599-fdb54db0ccea";
+  const classUrl = `https://kc.zhixueyun.com/#/train-new/class-detail/${classId}`;
+  const html = `
+    <a href="https://kc.zhixueyun.com/#/study/course/preview/${courseId}">预览课程</a>
+    <div onclick="window.open('/#/study/subject/preview/${subjectId}/1')">预览专题</div>
+    <div onclick="window.open('#/train-new/class-detail-preview/${classId}')">预览班级</div>
+    <div onclick="window.open('/#/study/course/preview/${courseId}/5/1/broken')">无效来源</div>
+  `;
+  assert.deepEqual(
+    extractLinks([html], root).sort(),
+    [COURSE, SUBJECT, classUrl].sort(),
+  );
+  const temp = await temporary(),
+    repo = new Repository(temp.dir);
+  let opened = 0;
+  try {
+    const result = await discover(
+      [`https://kc.zhixueyun.com/#/study/course/preview/${courseId}`],
+      {
+        repo,
+        lease: {
+          account: "a",
+          generation: 0,
+          fingerprint: "x",
+          signal: new AbortController().signal,
+        },
+        report() {},
+        auth: {
+          assert() {},
+          async navigate() {
+            opened++;
+            throw new Error("course preview must not open a catalog tab");
+          },
+        },
+      } as unknown as DiscoveryContext,
+    );
+    assert.equal(result.complete, true);
+    assert.equal(opened, 0);
+    assert.equal(result.found.length, 1);
+    assert.equal(result.found[0].url, COURSE);
+    assert.equal(repo.queue("a", "learn")[0].url, COURSE);
+  } finally {
+    repo.close();
+    await temp.close();
+  }
+});
+
+test("catalog expansion skips stale DOM nodes and wrapper containers without aborting discovery", async () => {
+  const root = "https://cms.mylearning.cn/topic/stale.html";
+  let clicks = 0;
+  const tab = {
+    url: root,
+    async evaluate() {
+      return snapshot(root, clicks ? [COURSE, EXAM] : [COURSE]);
+    },
+    async queryAll() {
+      if (clicks) return [];
+      return [
+        {
+          async evaluate() {
+            throw new StaleElementError("detached during render");
+          },
+          async click() {
+            assert.fail("stale element must not be clicked");
+          },
+        },
+        {
+          async evaluate() {
+            return {
+              text: "加载更多",
+              nested: true,
+              disabled: false,
+              href: "",
+              values: [],
+            };
+          },
+          async click() {
+            assert.fail("wrapper container must not be clicked");
+          },
+        },
+        {
+          async evaluate() {
+            return {
+              text: "加载更多",
+              nested: false,
+              disabled: false,
+              href: "",
+              values: [],
+            };
+          },
+          async click() {
+            clicks++;
+          },
+        },
+      ];
+    },
+  } as unknown as Tab;
+  const ctx = {
+    lease: { signal: new AbortController().signal },
+    auth: { assert() {} },
+  } as unknown as DiscoveryContext;
+  const result = await catalogManifest(tab, ctx);
+  assert.equal(clicks, 1);
+  assert.equal(result.complete, true);
+  assert.deepEqual(result.links, [COURSE, EXAM]);
+});
+
+test("retrying a stored preview entry upgrades it to the canonical course without looping or completing its parent early", async () => {
+  const temp = await temporary(),
+    repo = new Repository(temp.dir);
+  const preview = COURSE.replace("/detail/", "/preview/");
+  const parent = repo.upsert("https://cms.mylearning.cn/topic/root.html", "a");
+  repo.outcome(parent.id, "WAITING_CHILDREN", {
+    discoveryComplete: true,
+    ownDiscoveryComplete: true,
+  });
+  const legacyId = "legacy-preview-entry-id";
+  const legacyIdentity = {
+    id: legacyId,
+    account: "a",
+    kind: "entry",
+    url: preview,
+    businessId: "legacy-preview-business",
+  };
+  repo.db
+    .prepare(
+      "INSERT INTO tasks(id,account,kind,url,identity,status) VALUES(?,?,?,?,?,'READY')",
+    )
+    .run(legacyId, "a", "entry", preview, JSON.stringify(legacyIdentity));
+  const legacy = repo.task(legacyId);
+  repo.link(parent, legacy, true);
+  repo.enqueue(legacy, "discover");
+  try {
+    await learn(
+      legacy,
+      {
+        repo,
+        lease: {
+          account: "a",
+          generation: 0,
+          fingerprint: "x",
+          signal: new AbortController().signal,
+        },
+        report() {},
+        auth: {
+          assert() {},
+          async navigate() {
+            throw new Error("should not navigate for canonical course");
+          },
+        },
+      } as unknown as DiscoveryContext,
+      configuration(undefined, temp.dir),
+      () => {},
+    );
+    assert.equal(repo.queue("a", "discover").length, 0);
+    assert.deepEqual(
+      repo.queue("a", "learn").map((t) => t.url),
+      [COURSE],
+    );
+    assert.equal(repo.task(legacyId).details.ignored, true);
+    assert.equal(repo.task(parent.id).status, "WAITING_CHILDREN");
+    repo.complete(repo.upsert(COURSE, "a"), { finishStatus: 2 });
+    assert.equal(repo.task(parent.id).status, "COMPLETED");
+  } finally {
+    repo.close();
+    await temp.close();
   }
 });

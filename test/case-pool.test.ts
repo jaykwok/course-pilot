@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { runInNewContext } from "node:vm";
-import { TimeoutError, type Tab } from "nodriver-ts";
+import {
+  DisconnectedError,
+  ProtocolError,
+  SessionEndedError,
+  TimeoutError,
+  type Tab,
+} from "nodriver-ts";
 import { waitForCasePoolSession } from "../src/browser/case-pool.ts";
 import { CASE_POOL } from "../src/domain/identity.ts";
 import { ReviewRequired } from "../src/utils.ts";
@@ -82,5 +88,77 @@ test("case-pool authentication can be cancelled and incomplete redirects remain 
   await assert.rejects(
     waitForCasePoolSession(tab, new AbortController().signal, () => {}, 0),
     ReviewRequired,
+  );
+});
+
+test("case-pool SSO retries transient context loss and OOPIF SessionEndedError, but propagates DisconnectedError", async () => {
+  const errors = [
+    new ProtocolError(
+      "Runtime.callFunctionOn",
+      -32000,
+      "Execution context was destroyed.",
+    ),
+    new ProtocolError(
+      "Runtime.evaluate",
+      -32000,
+      "Inspected target navigated or closed",
+    ),
+    new SessionEndedError("detached", "iframe-target-1"),
+  ];
+  let checks = 0;
+  const tab = {
+    closed: false,
+    frames: [
+      {
+        url: CASE_POOL,
+        detached: false,
+        async query() {
+          throw errors.shift()!;
+        },
+        async queryAll() {
+          return [];
+        },
+      },
+    ],
+    async waitForFunction() {
+      if (checks++ < 3) throw new TimeoutError("redirect pending");
+      return true;
+    },
+  } as unknown as Tab;
+  await waitForCasePoolSession(
+    tab,
+    new AbortController().signal,
+    () => {},
+    2000,
+  );
+  assert.equal(errors.length, 0);
+  assert.equal(checks, 4);
+
+  const disconnected = {
+    closed: false,
+    frames: [
+      {
+        url: CASE_POOL,
+        detached: false,
+        async query() {
+          throw new DisconnectedError("browser socket closed");
+        },
+        async queryAll() {
+          return [];
+        },
+      },
+    ],
+    async waitForFunction() {
+      throw new TimeoutError("redirect pending");
+    },
+  } as unknown as Tab;
+  await assert.rejects(
+    waitForCasePoolSession(
+      disconnected,
+      new AbortController().signal,
+      () => {},
+      2000,
+    ),
+    DisconnectedError,
   );
 });

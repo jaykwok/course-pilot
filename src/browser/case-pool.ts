@@ -1,6 +1,8 @@
 import {
   InputActionError,
+  isContextGone,
   ProtocolError,
+  SessionEndedError,
   StaleElementError,
   TimeoutError,
   type Tab,
@@ -99,6 +101,8 @@ export async function waitForCasePoolSession(
                 ) &&
                 !e.matches(":disabled") &&
                 e.getAttribute("aria-disabled") !== "true",
+              undefined,
+              { timeout: 1000, signal },
             );
             if (!eligible) continue;
             await button.click({ timeout: 3000, signal, guard });
@@ -118,10 +122,10 @@ export async function waitForCasePoolSession(
       if (
         error instanceof TimeoutError ||
         error instanceof StaleElementError ||
+        isContextGone(error) ||
+        (error instanceof SessionEndedError && !tab.closed) ||
         (error instanceof ProtocolError &&
-          /context.*(?:destroyed|not found)|cannot find context|no frame with given id/i.test(
-            error.protocolMessage,
-          ))
+          /no frame with given id/i.test(error.protocolMessage))
       )
         continue;
       throw error;

@@ -13,7 +13,7 @@ async function main() {
     throw new Error("请安装 Node.js 24.22.0 或更高版本");
   const config = configuration();
   if (process.argv.includes("--check-startup")) {
-    executable(config.browserPath);
+    await executable(config.browserPath);
     console.log("Node.js 和浏览器已就绪");
     return;
   }

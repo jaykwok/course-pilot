@@ -315,8 +315,10 @@ export async function applyAnswers(
       });
       if (elements.length !== q.options.length) return false;
       const element = elements[index];
-      const control = (await element.evaluate((e) =>
-        e.matches('input[type="checkbox"],input[type="radio"]'),
+      const control = (await element.evaluate(
+        (e) => e.matches('input[type="checkbox"],input[type="radio"]'),
+        undefined,
+        { timeout: 3000, signal: ctx.lease.signal },
       ))
         ? element
         : await element.query('input[type="checkbox"],input[type="radio"]', {
@@ -331,12 +333,16 @@ export async function applyAnswers(
       };
       const native =
         control &&
-        (await control.evaluate((element) => {
-          const input = element as HTMLInputElement;
-          return [input, ...Array.from(input.labels || [])].some((target) =>
-            target.checkVisibility({ visibilityProperty: true }),
-          );
-        }));
+        (await control.evaluate(
+          (element) => {
+            const input = element as HTMLInputElement;
+            return [input, ...Array.from(input.labels || [])].some((target) =>
+              target.checkVisibility({ visibilityProperty: true }),
+            );
+          },
+          undefined,
+          { timeout: 3000, signal: ctx.lease.signal },
+        ));
       if (native) {
         await control.setChecked(
           answers.includes(q.options[index].label),

@@ -19,7 +19,7 @@ export async function continueArchivedCourse(
       signal,
     },
   )) {
-    if (!/归档/.test(await dialog.text())) continue;
+    if (!/归档/.test(await dialog.text({ timeout: 3000, signal }))) continue;
     for (const button of await dialog.queryAll(
       'button,.btn,a,span,[role="button"],[id$="goOnStudy"]',
       {
@@ -28,12 +28,18 @@ export async function continueArchivedCourse(
         signal,
       },
     )) {
-      if ((await button.text()).replace(/\s/g, "") !== "继续学习") continue;
+      if (
+        (await button.text({ timeout: 3000, signal })).replace(/\s/g, "") !==
+        "继续学习"
+      )
+        continue;
       if (
         await button.evaluate(
           (e) =>
             e.matches(":disabled") ||
             e.getAttribute("aria-disabled") === "true",
+          undefined,
+          { timeout: 3000, signal },
         )
       )
         continue;
@@ -133,12 +139,15 @@ export async function clickText(
     timeout: 5000,
     signal,
   })) {
-    const value = await element.evaluate((e) => ({
-      text: (e.innerText || e.textContent || "").replace(/\s/g, ""),
-      disabled:
-        e.hasAttribute("disabled") ||
-        e.getAttribute("aria-disabled") === "true",
-    }));
+    const value = await element.evaluate(
+      (e) => ({
+        text: (e.innerText || e.textContent || "").replace(/\s/g, ""),
+        disabled:
+          e.matches(":disabled") || e.getAttribute("aria-disabled") === "true",
+      }),
+      undefined,
+      { timeout: 3000, signal },
+    );
     if (wanted.includes(value.text) && !value.disabled) {
       await element.click({ signal, timeout: 5000, guard });
       return true;
@@ -239,18 +248,22 @@ export async function dismissOverlays(tab: Tab, signal: AbortSignal) {
     { visible: true, timeout: 5000, signal },
   );
   for (const element of elements.slice(-2)) {
-    const business = await element.evaluate((e) => {
-      const d = e.closest(
-        '.ant-modal-content,[role="dialog"],.dialog,[data-region="modal:modal"]',
-      );
-      return (
-        !!d &&
-        (!!d.querySelector(".ant-rate,.preview-list,.answer-input-shot") ||
-          /归档|继续学习|我要交卷|确认交卷|提交试卷|评分|评价/.test(
-            d.textContent || "",
-          ))
-      );
-    });
+    const business = await element.evaluate(
+      (e) => {
+        const d = e.closest(
+          '.ant-modal-content,[role="dialog"],.dialog,[data-region="modal:modal"]',
+        );
+        return (
+          !!d &&
+          (!!d.querySelector(".ant-rate,.preview-list,.answer-input-shot") ||
+            /归档|继续学习|我要交卷|确认交卷|提交试卷|评分|评价/.test(
+              d.textContent || "",
+            ))
+        );
+      },
+      undefined,
+      { timeout: 3000, signal },
+    );
     if (!business) await element.click({ signal, timeout: 3000 });
   }
 }

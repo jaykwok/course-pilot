@@ -1,7 +1,9 @@
 import {
   ActionabilityError,
   InputActionError,
+  isContextGone,
   ProtocolError,
+  SessionEndedError,
   StaleElementError,
   TimeoutError,
   type Tab,
@@ -30,7 +32,11 @@ export async function applyLoginPreferences(tab: Tab, signal: AbortSignal) {
         ...options,
         visible: true,
       })) {
-        const selected = await group.evaluate(durationSelected);
+        const selected = await group.evaluate(
+          durationSelected,
+          undefined,
+          options,
+        );
         if (!selected) {
           const menu = await group.query(".login-select", {
             ...options,
@@ -51,7 +57,8 @@ export async function applyLoginPreferences(tab: Tab, signal: AbortSignal) {
           }
           if (option) await option.click(options);
         }
-        if (!(await group.evaluate(durationSelected))) continue;
+        if (!(await group.evaluate(durationSelected, undefined, options)))
+          continue;
         const checkbox = await group.query('i[id^="j-auto-login"]', {
           ...options,
           visible: true,
@@ -62,6 +69,8 @@ export async function applyLoginPreferences(tab: Tab, signal: AbortSignal) {
             (e) =>
               e.getAttribute("data-index") === "1" ||
               e.classList.contains("checkbox-icon2"),
+            undefined,
+            options,
           ))
         )
           await checkbox.click(options);
@@ -75,6 +84,8 @@ export async function applyLoginPreferences(tab: Tab, signal: AbortSignal) {
             (e) =>
               e.getAttribute("data-index") === "1" ||
               e.classList.contains("checkbox-icon2"),
+            undefined,
+            options,
           ))
         )
           await checkbox.click(options);
@@ -93,14 +104,14 @@ export async function applyLoginPreferences(tab: Tab, signal: AbortSignal) {
         error instanceof StaleElementError ||
         error instanceof ActionabilityError ||
         error instanceof TimeoutError ||
+        isContextGone(error) ||
+        (error instanceof SessionEndedError && !tab.closed) ||
         (error instanceof ProtocolError &&
           ((error.method === "DOM.scrollIntoViewIfNeeded" &&
             error.protocolMessage.includes(
               "Node does not have a layout object",
             )) ||
-            /context.*(?:destroyed|not found)|cannot find context|no frame with given id/i.test(
-              error.protocolMessage,
-            )))
+            /no frame with given id/i.test(error.protocolMessage)))
       )
         continue;
       throw error;
