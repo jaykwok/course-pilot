@@ -443,6 +443,18 @@
               <use href="#i-chevron-right" />
             </svg>
           </button>
+          <button type="button" class="row" id="export-logs">
+            <svg class="icon row-icon" aria-hidden="true">
+              <use href="#i-download" />
+            </svg>
+            <span class="row-text">
+              <strong>导出错误日志</strong>
+              <small>一键导出脱敏诊断报告，便于排查根因</small>
+            </span>
+            <svg class="icon chevron" aria-hidden="true">
+              <use href="#i-chevron-right" />
+            </svg>
+          </button>
         </div>
         <input
           type="file"
@@ -548,6 +560,17 @@
               <svg class="icon"><use href="#i-chevron-down" /></svg>
             </span>
           </summary>
+          <div class="logs-bar">
+            <span class="logs-bar-note"
+              >导出包含异常任务、失败章节与脱敏日志</span
+            >
+            <button type="button" id="logs-export" class="plain">
+              <svg class="icon" aria-hidden="true">
+                <use href="#i-download" />
+              </svg>
+              导出错误日志
+            </button>
+          </div>
           <div id="logs" role="log" aria-label="活动日志"></div>
         </details>
       </section>
@@ -564,6 +587,9 @@
           <use href="#i-warning-fill" />
         </svg>
         <p id="error" role="alert"></p>
+        <button type="button" id="error-export" class="plain toast-action">
+          导出日志
+        </button>
         <button
           type="button"
           id="error-close"
@@ -605,12 +631,20 @@
           <div id="queue-issues" hidden>
             <div class="issues-head">
               <span class="group-title">失败原因</span>
-              <button type="button" id="queue-refresh" class="plain">
-                <svg class="icon" aria-hidden="true">
-                  <use href="#i-refresh" />
-                </svg>
-                刷新
-              </button>
+              <div class="issues-actions">
+                <button type="button" id="issues-export-logs" class="plain">
+                  <svg class="icon" aria-hidden="true">
+                    <use href="#i-download" />
+                  </svg>
+                  导出日志
+                </button>
+                <button type="button" id="queue-refresh" class="plain">
+                  <svg class="icon" aria-hidden="true">
+                    <use href="#i-refresh" />
+                  </svg>
+                  刷新
+                </button>
+              </div>
             </div>
             <ul id="queue-issue-list" class="group-box issue-list"></ul>
             <p id="queue-empty" class="group-box empty-state">暂无异常任务</p>

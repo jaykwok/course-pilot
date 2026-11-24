@@ -5,6 +5,7 @@ import {
   DisconnectedError,
   ProtocolError,
   SessionEndedError,
+  StaleElementError,
   TimeoutError,
   type Tab,
 } from "nodriver-ts";
@@ -91,7 +92,7 @@ test("case-pool authentication can be cancelled and incomplete redirects remain 
   );
 });
 
-test("case-pool SSO retries transient context loss and OOPIF SessionEndedError, but propagates DisconnectedError", async () => {
+test("case-pool SSO retries transient context loss, StaleElementError and OOPIF SessionEndedError, but propagates DisconnectedError", async () => {
   const errors = [
     new ProtocolError(
       "Runtime.callFunctionOn",
@@ -103,6 +104,7 @@ test("case-pool SSO retries transient context loss and OOPIF SessionEndedError, 
       -32000,
       "Inspected target navigated or closed",
     ),
+    new StaleElementError("frame detached"),
     new SessionEndedError("detached", "iframe-target-1"),
   ];
   let checks = 0;
@@ -121,7 +123,7 @@ test("case-pool SSO retries transient context loss and OOPIF SessionEndedError, 
       },
     ],
     async waitForFunction() {
-      if (checks++ < 3) throw new TimeoutError("redirect pending");
+      if (checks++ < 4) throw new TimeoutError("redirect pending");
       return true;
     },
   } as unknown as Tab;
@@ -132,7 +134,7 @@ test("case-pool SSO retries transient context loss and OOPIF SessionEndedError, 
     2000,
   );
   assert.equal(errors.length, 0);
-  assert.equal(checks, 4);
+  assert.equal(checks, 5);
 
   const disconnected = {
     closed: false,

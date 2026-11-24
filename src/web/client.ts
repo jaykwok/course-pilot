@@ -173,6 +173,88 @@ const error = (message: string) => {
   $("error").textContent = message || "";
   if (!message) $("error-toast").hidden = true;
 };
+
+function triggerDownload(filename: string, content: BlobPart, type: string) {
+  const url = URL.createObjectURL(new Blob([content], { type }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.style.display = "none";
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function buildOfflineDiagnosticLog(reason: string): string {
+  const lines = [
+    "========================================",
+    "Course Pilot 前端兜底错误日志（后端连接不可用）",
+    "========================================",
+    `导出时间: ${new Date().toISOString()}`,
+    `回退原因: ${reason}`,
+    `连接状态: ${$("connection").textContent || ""}`,
+    `当前页面状态: ${$("operation-title").textContent || ""} / ${$("status").textContent || ""}`,
+  ];
+  const toastError = $("error").textContent?.trim();
+  if (toastError) lines.push(`错误提示: ${toastError}`);
+  if (state?.notification)
+    lines.push(
+      `最近通知: [${state.notification.tone}] ${state.notification.message}`,
+    );
+  if (state?.summary) {
+    lines.push(
+      `最近摘要: [${state.summary.tone || "info"}] ${state.summary.title}`,
+    );
+    for (const [k, v] of state.summary.rows || [])
+      lines.push(`  - ${k}: ${String(v ?? "")}`);
+  }
+  if (localQueues.accounts.length) {
+    lines.push("", "=== 已加载的异常任务 ===");
+    for (const account of localQueues.accounts) {
+      for (const task of account.failures) {
+        lines.push(`[${task.recovery}] ${task.url}`);
+        lines.push(`  原因: ${task.message}`);
+        for (const section of task.sections || [])
+          lines.push(`  - 章节 ${section.section}: ${section.message}`);
+      }
+    }
+  }
+  lines.push("", "=== 最近内存日志 ===");
+  if (state?.logs?.length) {
+    for (const entry of state.logs)
+      lines.push(`#${entry.seq} [${entry.level}] ${entry.message}`);
+  } else lines.push("（暂无日志）");
+  return lines.join("\n") + "\n";
+}
+
+let exportingLogs = false;
+async function exportDiagnosticLogs() {
+  if (exportingLogs) return;
+  exportingLogs = true;
+  try {
+    const response = await fetch("/api/diagnostics/export");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const content = await response.text();
+    const match = response.headers
+      .get("content-disposition")
+      ?.match(/filename="([^"]+)"/);
+    const filename =
+      match?.[1] ||
+      `course-pilot-error-log-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
+    triggerDownload(filename, content, "text/plain; charset=utf-8");
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
+    const filename = `course-pilot-error-log-offline-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
+    triggerDownload(
+      filename,
+      buildOfflineDiagnosticLog(reason),
+      "text/plain; charset=utf-8",
+    );
+  } finally {
+    exportingLogs = false;
+  }
+}
 const text = <T extends keyof HTMLElementTagNameMap>(
   tag: T,
   value: unknown,
@@ -772,8 +854,14 @@ function renderNotification(notification: Snapshot["notification"]) {
   host.append(
     icon(TONE_ICONS[notification.tone] || TONE_ICONS.info, "toast-icon"),
     text("p", notification.message),
-    close,
   );
+  if (notification.tone === "error") {
+    const exportBtn = text("button", "导出日志", "plain toast-action");
+    exportBtn.type = "button";
+    exportBtn.onclick = () => void exportDiagnosticLogs();
+    host.append(exportBtn);
+  }
+  host.append(close);
   armNotification();
 }
 
@@ -796,13 +884,22 @@ function renderSummary(summary: Snapshot["summary"]) {
   head.append(glyph, text("h2", summary.title), close);
   host.append(head);
   rows(host, summary.rows);
+  const actions = text("div", "", "summary-actions");
   if (summary.download) {
     const link = text("a", "", "download-link");
     link.append(icon("i-download"), "下载 JSON 文件");
     link.href = summary.download.href;
     link.download = summary.download.filename;
-    host.append(link);
+    actions.append(link);
   }
+  if (tone === "error" || tone === "info") {
+    const exportBtn = text("button", "", "plain summary-export");
+    exportBtn.type = "button";
+    exportBtn.append(icon("i-download"), "导出错误日志");
+    exportBtn.onclick = () => void exportDiagnosticLogs();
+    actions.append(exportBtn);
+  }
+  if (actions.childElementCount) host.append(actions);
 }
 
 function render(snapshot: Snapshot) {
@@ -1072,6 +1169,10 @@ $("clear-workbench").onclick = () => {
   $("workbench-input").focus();
 };
 $("error-close").onclick = () => error("");
+$("error-export").onclick = () => void exportDiagnosticLogs();
+$("export-logs").onclick = () => void exportDiagnosticLogs();
+$("logs-export").onclick = () => void exportDiagnosticLogs();
+$("issues-export-logs").onclick = () => void exportDiagnosticLogs();
 $("cancel").onclick = () =>
   send("/api/control/cancel", { operation_id: state?.operation_id });
 $("stop").onclick = () =>

@@ -2,9 +2,11 @@ import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import {
+  ActionabilityError,
   DisconnectedError,
   ProtocolError,
   SessionEndedError,
+  StaleElementError,
   TimeoutError,
   type Tab,
 } from "nodriver-ts";
@@ -204,7 +206,7 @@ test("revoked credentials update the dashboard until verified again", async (t) 
   }
 });
 
-test("login preferences ignore transient context loss and OOPIF SessionEndedError, but propagate DisconnectedError", async () => {
+test("login preferences ignore transient context loss, normalized stale/actionability errors and OOPIF SessionEndedError, but propagate DisconnectedError", async () => {
   const signal = new AbortController().signal;
   const tab = {
     closed: false,
@@ -217,6 +219,18 @@ test("login preferences ignore transient context loss and OOPIF SessionEndedErro
             -32000,
             "Inspected target navigated or closed",
           );
+        },
+      },
+      {
+        detached: false,
+        async queryAll() {
+          throw new StaleElementError("frame detached");
+        },
+      },
+      {
+        detached: false,
+        async queryAll() {
+          throw new ActionabilityError("Node does not have a layout object");
         },
       },
       {

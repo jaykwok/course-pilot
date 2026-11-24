@@ -19,7 +19,7 @@ export interface QueueBundle {
   sources: { parent: string; child: string; required: boolean }[];
 }
 
-function portableUrl(raw: string): string {
+export function portableUrl(raw: string): string {
   const url = new URL(normalize(raw));
   const clean = (params: URLSearchParams) => {
     for (const key of [...params.keys()])

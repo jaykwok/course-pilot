@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { WebSocket } from "ws";
+import { InputActionError, TimeoutError } from "nodriver-ts";
 import { WebServer } from "../src/web/server.ts";
 import { token, until, sleep } from "../src/utils.ts";
-import { application, COURSE } from "./helpers.ts";
+import { application, COURSE, inputReport } from "./helpers.ts";
 import { IMPORT_INBOX } from "../src/storage/transfer.ts";
 import { defaults, readSettings, saveSettings } from "../src/config.ts";
 import { modelService } from "./model-service.ts";
@@ -471,6 +472,95 @@ test("portable file upload and download work offline behind the local session an
     assert.equal(f.repo.queue(IMPORT_INBOX, "learn").length, 1);
     f.chrome.assertDone();
   } finally {
+    await f.cleanup();
+  }
+});
+
+test("one-click diagnostic log export works while busy or read-only, includes failures and redacts secrets", async () => {
+  const f = await fixture();
+  let release!: () => void;
+  try {
+    const saved = defaults();
+    saved.openai.apiKey = "sk-super-secret-diagnostic-key";
+    await saveSettings(f.app.config.settingsPath, saved);
+
+    const task = f.repo.upsert(COURSE, "diag-account");
+    const runId = f.repo.begin(task, "learn");
+    f.repo.review(task, "partial_course_failure", {
+      recovery: "retry",
+      message: "部分章节尚未完成",
+      sections: [
+        {
+          section: "sec-70",
+          recovery: "retry",
+          message: "Input click interrupted after 33 events",
+        },
+      ],
+    });
+    f.repo.end(runId, "NEEDS_REVIEW", {
+      message: "部分章节尚未完成 token=run-secret",
+      answers: { q1: "should-never-appear" },
+    });
+    const inputErr = new InputActionError(
+      inputReport({ events: 33, dispatched: 0, sent: { wheels: 33 } }),
+      new TimeoutError("Input deadline exceeded token=err-secret"),
+    );
+    f.app.logger.log(inputErr, "error", "章节 sec-70 学习异常");
+    f.app.logger.log("Bearer secret-bearer-token sk-inline-secret", "warn");
+
+    assert.equal(
+      (await fetch(f.origin + "/api/diagnostics/export")).status,
+      401,
+    );
+    assert.equal(
+      (
+        await fetch(f.origin + "/api/diagnostics/export", {
+          headers: { Cookie: f.cookie, Origin: "https://evil.test" },
+        })
+      ).status,
+      403,
+    );
+
+    const writer = await f.connect();
+    f.app.execute = () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    await f.post(
+      "/api/operations",
+      { kind: "learn", request_id: token() },
+      writer.snapshot.generation,
+    );
+    assert.ok(f.app.operationId);
+
+    const response = await fetch(f.origin + "/api/diagnostics/export", {
+      headers: { Cookie: f.cookie },
+    });
+    assert.equal(response.status, 200);
+    assert.match(
+      response.headers.get("content-type")!,
+      /^text\/plain; charset=utf-8/i,
+    );
+    assert.match(
+      response.headers.get("content-disposition")!,
+      /attachment; filename="course-pilot-error-log-.*\.txt"/,
+    );
+    const body = await response.text();
+    assert.match(body, /Course Pilot 诊断与错误日志/);
+    assert.match(body, /sec-70/);
+    assert.match(body, /Input click interrupted after 33 events/);
+    assert.match(body, /"wheels":33/);
+    assert.match(body, /TimeoutError: Input deadline exceeded/);
+    assert.ok(!body.includes("sk-super-secret-diagnostic-key"));
+    assert.ok(!body.includes("sk-inline-secret"));
+    assert.ok(!body.includes("secret-bearer-token"));
+    assert.ok(!body.includes("run-secret"));
+    assert.ok(!body.includes("err-secret"));
+    assert.ok(!body.includes("should-never-appear"));
+    f.chrome.assertDone();
+  } finally {
+    release?.();
+    await f.app.settled();
     await f.cleanup();
   }
 });

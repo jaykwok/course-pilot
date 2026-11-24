@@ -203,6 +203,16 @@ export class WebServer {
         this.json(res, 200, this.app.localQueues());
         return;
       }
+      if (req.method === "GET" && path === "/api/diagnostics/export") {
+        const report = this.app.diagnosticLog();
+        this.headers(res);
+        res.writeHead(200, {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Content-Disposition": `attachment; filename="${report.filename}"`,
+        });
+        res.end(report.content);
+        return;
+      }
       const exportId = path.match(/^\/api\/exports\/([\w-]+)$/)?.[1];
       if (req.method === "GET" && exportId) {
         const file = this.app.exports.get(exportId);

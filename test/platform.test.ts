@@ -24,7 +24,12 @@ import {
 } from "../src/platform/references.ts";
 import { entry } from "../src/domain/identity.ts";
 import { COURSE, EXAM, inputReport } from "./helpers.ts";
-import { accessProblem, clickPlayerControl } from "../src/platform/dom.ts";
+import {
+  accessProblem,
+  clickPlayerControl,
+  continueArchivedCourse,
+  startRegisteredCourse,
+} from "../src/platform/dom.ts";
 import type { Element as BrowserElement } from "nodriver-ts";
 
 test("answer verification preserves ordering answers and treats multiple choice as a set", () => {
@@ -71,6 +76,105 @@ test("player input uses the library action guard and refuses other frames", asyn
       assert.equal(pressed, false);
     }
   }
+});
+
+test("archive and registration overlays use Element.isEnabled and Locator.waitFor(hidden)", async () => {
+  const signal = new AbortController().signal;
+  const waits: { selector: string; hasText?: string; state?: string }[] = [];
+  let readyChecks = 0,
+    clickedDisabled = false,
+    clickedEnabled = false;
+  const archiveTab = {
+    async queryAll() {
+      return [
+        {
+          async text() {
+            return "该课程已归档，是否继续学习？";
+          },
+          async queryAll() {
+            return [
+              {
+                async text() {
+                  return "继续学习";
+                },
+                async isEnabled() {
+                  return false;
+                },
+                async click() {
+                  clickedDisabled = true;
+                },
+              },
+              {
+                async text() {
+                  return "继续学习";
+                },
+                async isEnabled() {
+                  return true;
+                },
+                async click() {
+                  clickedEnabled = true;
+                },
+              },
+            ];
+          },
+        },
+      ];
+    },
+    locator(selector: string) {
+      return {
+        filter({ hasText }: { hasText?: string }) {
+          return {
+            async waitFor(options?: { state?: string }) {
+              waits.push({ selector, hasText, state: options?.state });
+            },
+          };
+        },
+      };
+    },
+    async waitForFunction(_fn: unknown, _arg: unknown, options: any) {
+      assert.equal(options.world, "isolated");
+      readyChecks++;
+    },
+  } as unknown as Tab;
+  assert.equal(
+    await continueArchivedCourse(archiveTab, signal, () => {}),
+    true,
+  );
+  assert.equal(clickedDisabled, false);
+  assert.equal(clickedEnabled, true);
+  assert.deepEqual(waits, [
+    {
+      selector: ".study-transition-page,.ant-modal-content",
+      hasText: "归档",
+      state: "hidden",
+    },
+  ]);
+  assert.equal(readyChecks, 1);
+
+  const registerWaits: { selector: string; state?: string }[] = [];
+  const registerTab = {
+    async query() {
+      return { async click() {} };
+    },
+    locator(selector: string) {
+      return {
+        async waitFor(options?: { state?: string }) {
+          registerWaits.push({ selector, state: options?.state });
+        },
+      };
+    },
+    async waitForFunction() {
+      readyChecks++;
+    },
+  } as unknown as Tab;
+  assert.equal(
+    await startRegisteredCourse(registerTab, signal, () => {}),
+    true,
+  );
+  assert.deepEqual(registerWaits, [
+    { selector: ".register-mask-layer", state: "hidden" },
+  ]);
+  assert.equal(readyChecks, 2);
 });
 
 test("chapter activation reacquires replaced rows but never replays partially dispatched input", async () => {

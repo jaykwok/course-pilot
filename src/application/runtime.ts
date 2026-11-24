@@ -32,6 +32,7 @@ import {
   IMPORT_INBOX,
   taskIssue,
 } from "../storage/transfer.ts";
+import { buildDiagnosticLog } from "../storage/diagnostics.ts";
 
 export class ProtocolError extends Error {
   status: number;
@@ -196,6 +197,24 @@ export class Application extends EventEmitter {
         })),
       })),
     };
+  }
+  diagnosticLog() {
+    return buildDiagnosticLog({
+      repo: this.repo,
+      logsDir: this.config.logsDir,
+      settingsPath: this.config.settingsPath,
+      root: this.config.root,
+      snapshot: {
+        account: this.account,
+        operationId: this.operationId,
+        kind: this.kind,
+        view: this.view,
+        dashboard: this.dashboard(),
+        logs: this.logs,
+        droppedLogs: this.droppedLogs,
+      },
+      accountLabel: (account) => this.localAccountLabel(account),
+    });
   }
   private notify(
     message: string,
@@ -503,6 +522,7 @@ export class Application extends EventEmitter {
         auth: this.auth,
         repo: this.repo,
         report,
+        logError: (error, context) => this.logger.log(error, "error", context),
       };
       if (kind === "select") {
         const collected = new Set<string>();
@@ -688,7 +708,18 @@ export class Application extends EventEmitter {
             this.repo.task(task.id).details,
           );
           if (state.status === "COMPLETED") completed++;
-          else review++;
+          else {
+            review++;
+            if (state.status === "NEEDS_REVIEW" || state.status === "BLOCKED") {
+              const sections = Array.isArray(state.details.sections)
+                ? `（${state.details.sections.length} 个异常章节）`
+                : "";
+              this.logger.log(
+                `任务未完成 [${state.status}] ${task.url}：${state.details.message || state.details.reason || "需复查"}${sections}`,
+                "error",
+              );
+            }
+          }
         } catch (e) {
           const status = lease.signal.aborted ? "INTERRUPTED" : "NEEDS_REVIEW";
           if (lease.signal.aborted || e instanceof AuthenticationError) {
@@ -708,7 +739,8 @@ export class Application extends EventEmitter {
             this.repo.task(task.id).details,
           );
           review++;
-          report(redact(e));
+          this.logger.log(e, "error");
+          this.update({ status: redact(e) });
         }
       }
       this.update({
@@ -723,7 +755,11 @@ export class Application extends EventEmitter {
         },
       });
     } catch (e) {
-      report(redact(e));
+      if (this.abort!.signal.aborted) report(redact(e));
+      else {
+        this.logger.log(e, "error");
+        this.update({ status: redact(e) });
+      }
       this.update({
         summary: {
           id: token(),

@@ -114,24 +114,78 @@ export async function progress(
 }
 async function selectCourseTab(tab: Tab, ctx: DiscoveryContext) {
   ctx.auth.assert(ctx.lease);
-  await clickText(
+  const switched = await clickText(
     tab,
     ["课程学习"],
     ctx.lease.signal,
     '.guide-tab > *:not(.guide-tab--selected),.guide-tab span:not(.guide-tab--selected),.guide-tab button:not(.guide-tab--selected),.guide-tab a:not(.guide-tab--selected),.guide-tab--item:not(.guide-tab--selected),[class*="guide-tab"]:not(.guide-tab--selected)',
     () => ctx.auth.assert(ctx.lease),
   );
+  if (switched)
+    await tab
+      .waitForFunction(
+        () =>
+          [...document.querySelectorAll(".guide-tab--selected")].some(
+            (e) => (e.textContent || "").replace(/\s/g, "") === "课程学习",
+          ),
+        undefined,
+        { timeout: 3000, signal: ctx.lease.signal, world: "isolated" },
+      )
+      .catch((e) => {
+        if (ctx.lease.signal.aborted) throw e;
+      });
+}
+/** Scroll custom jScrollPane chapter lists through their own API so 500ms autoReinitialise does not snap back native scrollTop. */
+async function revealChapterRow(
+  tab: Tab,
+  rowSelector: string,
+  dlSelector: string,
+  signal: AbortSignal,
+) {
+  await tab.evaluate(
+    ({ rowSelector, dlSelector }) => {
+      const target = (document.querySelector(rowSelector) ||
+        document.querySelector(dlSelector)) as HTMLElement | null;
+      if (!target) return;
+      const container = target.closest(".jspContainer") as HTMLElement | null;
+      const scrollable = container?.parentElement as HTMLElement | null;
+      const $ = (window as any).$;
+      const jsp = scrollable && $ ? $(scrollable).data?.("jsp") : null;
+      if (container && jsp && typeof jsp.scrollToY === "function") {
+        const pane = container.querySelector(".jspPane") as HTMLElement | null;
+        if (pane) {
+          const offset =
+            target.getBoundingClientRect().top -
+            pane.getBoundingClientRect().top;
+          const centered = Math.max(
+            0,
+            offset -
+              Math.max(0, (container.clientHeight - target.offsetHeight) / 2),
+          );
+          jsp.scrollToY(centered, false);
+        } else if (typeof jsp.scrollToElement === "function") {
+          jsp.scrollToElement(target, true, false);
+        }
+        if (container.scrollTop !== 0) container.scrollTop = 0;
+        const rect = target.getBoundingClientRect();
+        if (rect.top < 16 || rect.bottom > innerHeight - 16)
+          window.scrollBy(0, rect.top + rect.height / 2 - innerHeight / 2);
+      }
+    },
+    { rowSelector, dlSelector },
+    { timeout: 3000, signal },
+  );
 }
 async function prepare(tab: Tab, ctx: DiscoveryContext) {
   await tab
-    .waitForFunction(
-      () =>
-        document.querySelector(
-          'dl.chapter-list-box,.guide-tab,.study-transition-page,.register-mask-layer,.error-page,.access-denied,.ant-result,.el-result,[role="alert"],[role="dialog"],.ant-modal-content,.el-dialog',
-        ) !== null,
-      undefined,
-      { timeout: 10000, signal: ctx.lease.signal },
+    .locator(
+      'dl.chapter-list-box,.guide-tab,.study-transition-page,.register-mask-layer,.error-page,.access-denied,.ant-result,.el-result,[role="alert"],[role="dialog"],.ant-modal-content,.el-dialog',
     )
+    .waitFor({
+      state: "attached",
+      timeout: 10000,
+      signal: ctx.lease.signal,
+    })
     .catch((e) => {
       if (ctx.lease.signal.aborted) throw e;
     });
@@ -172,7 +226,8 @@ async function rating(tab: Tab, ctx: DiscoveryContext) {
       if (
         (
           await button.text({ timeout: 3000, signal: ctx.lease.signal })
-        ).replace(/\s/g, "") === "确定"
+        ).replace(/\s/g, "") === "确定" &&
+        (await button.isEnabled({ timeout: 3000, signal: ctx.lease.signal }))
       ) {
         await button.click({
           signal: ctx.lease.signal,
@@ -205,6 +260,12 @@ export async function activate(tab: Tab, s: Section, ctx: DiscoveryContext) {
     ctx.auth.assert(ctx.lease);
     // The platform can activate the first chapter itself during page startup.
     if (await focused()) return selector;
+    await revealChapterRow(
+      tab,
+      `${selector} .section-item-wrapper`,
+      selector,
+      ctx.lease.signal,
+    );
     try {
       await row.click(input);
     } catch (error) {
@@ -220,6 +281,12 @@ export async function activate(tab: Tab, s: Section, ctx: DiscoveryContext) {
       // Late guide content can move the next chapter while the pointer travels.
       // Reposition once only when no press was sent; retain native hit checks.
       if (!(await focused())) {
+        await revealChapterRow(
+          tab,
+          `${selector} .section-item-wrapper`,
+          selector,
+          ctx.lease.signal,
+        );
         await row.hover(input);
         if (!(await focused())) await row.click(input);
       }
@@ -228,7 +295,7 @@ export async function activate(tab: Tab, s: Section, ctx: DiscoveryContext) {
       (selector) =>
         document.querySelector(selector)?.classList.contains("focus"),
       selector,
-      { timeout: 5000, signal: ctx.lease.signal },
+      { timeout: 10000, signal: ctx.lease.signal, world: "isolated" },
     );
     return selector;
   } catch (e) {
@@ -370,11 +437,33 @@ export async function learn(
             timeout: 5000,
             signal: ctx.lease.signal,
           });
-          if (!playback.focused)
-            throw new ReviewRequired(
-              "section_focus_lost",
-              "当前章节焦点已变化",
-            );
+          if (!playback.focused) {
+            // The platform can auto-advance to the next chapter right as a video finishes,
+            // or briefly detach .focus during a periodic chapter-list re-render.
+            states = await progress(http, task, sections);
+            if (String(states.get(s.id.toLowerCase())?.finishStatus) === "2") {
+              finished = true;
+              break;
+            }
+            await sleep(600, ctx.lease.signal);
+            const recheck = await tab.evaluate(playbackSnapshot, selector, {
+              timeout: 5000,
+              signal: ctx.lease.signal,
+            });
+            if (!recheck.focused) {
+              states = await progress(http, task, sections);
+              if (
+                String(states.get(s.id.toLowerCase())?.finishStatus) === "2"
+              ) {
+                finished = true;
+                break;
+              }
+              throw new ReviewRequired(
+                "section_focus_lost",
+                "当前章节焦点已变化",
+              );
+            }
+          }
           const media = playback.media;
           if (video) {
             if (media?.error)
@@ -413,6 +502,7 @@ export async function learn(
       } catch (e) {
         if (ctx.lease.signal.aborted || e instanceof AuthenticationError)
           throw e;
+        ctx.logError?.(e, `章节 ${s.name || s.id} 学习异常`);
         issues.push({
           section: s.id,
           message: e instanceof Error ? e.message : "章节学习失败",

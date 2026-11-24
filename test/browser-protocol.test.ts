@@ -70,6 +70,10 @@ test("persistent browser launch stays visible, disables extensions and retains i
     t.mock.method(Browser, "launch", async (options: any) => {
       assert.equal(options.headless, false);
       assert.equal(options.userDataDir, dir);
+      assert.deepEqual(options.windowSize, { width: 1366, height: 900 });
+      assert.ok(
+        !options.args.some((arg: string) => arg.startsWith("--window-size=")),
+      );
       assert.ok(options.args.includes("--disable-extensions"));
       assert.ok(options.args.includes("--disable-sync"));
       assert.ok(!options.args.includes("--no-sandbox"));
@@ -447,12 +451,77 @@ test("beforeSend blocks forbidden CDP commands before touching the wire", async 
   }
 });
 
-test("executable delegates override validation to findExecutable and reports clear errors", async () => {
+test("executable delegates override validation and preserves CHROME_PATH precedence", async () => {
   assert.equal(await executable(process.execPath), process.execPath);
+  const previous = process.env.CHROME_PATH;
+  process.env.CHROME_PATH = process.execPath;
+  try {
+    assert.equal(await executable(), process.execPath);
+  } finally {
+    if (previous === undefined) delete process.env.CHROME_PATH;
+    else process.env.CHROME_PATH = previous;
+  }
   await assert.rejects(
     executable(join(process.cwd(), "nonexistent-browser-binary-for-test")),
     /browser\.executable/,
   );
+});
+
+test("management tab emits onClose when its target is destroyed", async () => {
+  const f = await application();
+  try {
+    const startup = f.browser.tabs[0];
+    f.chrome.handle("Page.navigate", ({ url }, command) => {
+      f.chrome.emit(
+        "Page.frameNavigated",
+        {
+          frame: {
+            id: startup.mainFrame.id,
+            loaderId: "mgmt",
+            url,
+            domainAndRegistry: "",
+            securityOrigin: new URL(url).origin,
+            mimeType: "text/html",
+            secureContextType: "Secure",
+            crossOriginIsolatedContextType: "NotIsolated",
+            gatedAPIFeatures: [],
+          } as Protocol.Page.Frame,
+          type: "Navigation",
+        },
+        command.sessionId,
+      );
+      f.chrome.emit(
+        "Page.lifecycleEvent",
+        {
+          frameId: startup.mainFrame.id,
+          loaderId: "mgmt",
+          name: "DOMContentLoaded",
+          timestamp: 1,
+        },
+        command.sessionId,
+      );
+      return { frameId: startup.mainFrame.id, loaderId: "mgmt" };
+    });
+    f.chrome.handle("Page.bringToFront", () => undefined);
+    const management = await f.runtime.openManagement(
+      "http://127.0.0.1:18765/",
+    );
+    let closed = 0;
+    const off = management.onClose.on(() => {
+      closed++;
+    });
+    try {
+      f.chrome.destroyTarget(management.id);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(closed, 1);
+      assert.equal(management.closed, true);
+    } finally {
+      off();
+    }
+    f.chrome.assertDone();
+  } finally {
+    await f.close();
+  }
 });
 
 test("BrowserRuntime.launch logs ProfileInUseError diagnostics before rethrowing", async (t) => {

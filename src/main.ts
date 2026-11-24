@@ -43,14 +43,9 @@ async function main() {
       else throw new Error("管理窗口已关闭，服务正在退出");
     };
     await lock.publish(server.origin, server.reopenKey);
-    await browser.openManagement(url);
+    const management = await browser.openManagement(url);
     // A closed management page is the lifecycle boundary; business popups never own shutdown.
-    const off = browser.browser.cdp.on(
-      "Target.targetDestroyed",
-      ({ targetId }) => {
-        if (targetId === browser!.management?.id) app!.exit();
-      },
-    );
+    const off = management.onClose.on(() => app!.exit());
     const signal = () => app!.exit();
     process.on("SIGINT", signal);
     process.on("SIGTERM", signal);

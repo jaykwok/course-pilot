@@ -1294,6 +1294,13 @@ dd {
   font-variant-numeric: tabular-nums;
 }
 
+.summary-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
 .download-link {
   display: inline-flex;
   align-items: center;
@@ -1368,6 +1375,20 @@ details[open] > summary .disclosure .icon {
 details[open] > summary .disclosure-show,
 details:not([open]) > summary .disclosure-hide {
   display: none;
+}
+
+.logs-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  margin: 0 24px 10px;
+}
+
+.logs-bar-note {
+  color: var(--label-3);
+  font-size: 12px;
 }
 
 #logs {
@@ -1459,6 +1480,12 @@ details:not([open]) > summary .disclosure-hide {
 
 .toast[data-tone="info"] .toast-icon {
   color: var(--accent);
+}
+
+.toast-action {
+  flex: none;
+  align-self: center;
+  pointer-events: auto;
 }
 
 .toast-close {
@@ -1954,9 +1981,17 @@ dialog.sheet > form {
 /* Failure list */
 .issues-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
+  gap: 6px 10px;
   margin-bottom: 8px;
+}
+
+.issues-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .issues-head .group-title {
@@ -2224,6 +2259,10 @@ dialog.sheet > form {
 
   .logs summary {
     padding: 16px 18px;
+  }
+
+  .logs-bar {
+    margin: 0 18px 10px;
   }
 
   #logs {

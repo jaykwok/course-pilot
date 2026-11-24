@@ -400,6 +400,22 @@ test(
       assert.equal(
         await page.evaluate(
           () =>
+            (document.getElementById("issues-export-logs") as HTMLButtonElement)
+              .disabled ||
+            (document.getElementById("export-logs") as HTMLButtonElement)
+              .disabled,
+        ),
+        false,
+      );
+      const diagnosticText = await page.evaluate(async () => {
+        const res = await fetch("/api/diagnostics/export");
+        return { status: res.status, text: await res.text() };
+      });
+      assert.equal(diagnosticText.status, 200);
+      assert.match(diagnosticText.text, /H5 章节需要人工学习/);
+      assert.equal(
+        await page.evaluate(
+          () =>
             (
               document.querySelector(
                 '[data-recovery="blocked"]',

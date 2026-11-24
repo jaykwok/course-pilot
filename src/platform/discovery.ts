@@ -41,6 +41,7 @@ export interface DiscoveryContext {
   lease: Lease;
   scope: TabScope;
   report: (text: string) => void;
+  logError?: (error: unknown, context?: string) => void;
 }
 
 export function subjectSectionCompleted(

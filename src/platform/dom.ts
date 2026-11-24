@@ -33,16 +33,7 @@ export async function continueArchivedCourse(
         "继续学习"
       )
         continue;
-      if (
-        await button.evaluate(
-          (e) =>
-            e.matches(":disabled") ||
-            e.getAttribute("aria-disabled") === "true",
-          undefined,
-          { timeout: 3000, signal },
-        )
-      )
-        continue;
+      if (!(await button.isEnabled({ timeout: 3000, signal }))) continue;
       await button.click({ signal, timeout: 5000, guard });
       await waitForOverlayExit(
         tab,
@@ -64,22 +55,16 @@ async function waitForOverlayExit(
   text = "",
 ) {
   guard();
+  const deadline = Date.now() + 5000;
+  const remaining = () => Math.max(1, deadline - Date.now());
+  const overlay = text
+    ? tab.locator(selector).filter({ hasText: text })
+    : tab.locator(selector);
+  await overlay.waitFor({ state: "hidden", timeout: remaining(), signal });
   await tab.waitForFunction(
-    ({ selector, text }) =>
-      document.readyState !== "loading" &&
-      ![...document.querySelectorAll(selector)].some((e) => {
-        const rect = e.getBoundingClientRect(),
-          style = getComputedStyle(e);
-        return (
-          rect.width > 0 &&
-          rect.height > 0 &&
-          style.visibility !== "hidden" &&
-          style.display !== "none" &&
-          (!text || e.textContent?.includes(text))
-        );
-      }),
-    { selector, text },
-    { timeout: 5000, signal },
+    () => document.readyState !== "loading",
+    undefined,
+    { timeout: remaining(), signal, world: "isolated" },
   );
   guard();
 }

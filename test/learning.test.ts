@@ -62,6 +62,7 @@ async function fixture() {
           async waitForFunction() {},
           locator() {
             return {
+              async waitFor() {},
               async element() {
                 return {
                   async evaluate() {
@@ -247,8 +248,17 @@ test("course preparation clicks plain child spans inside .guide-tab when AI comp
           async query() {
             return null;
           },
-          async waitForFunction(fn: Function) {
-            if (fn.toString().includes(".guide-tab")) waitedForDom = true;
+          async waitForFunction() {},
+          locator(selector: string) {
+            return {
+              async waitFor(options?: { state?: string }) {
+                if (
+                  selector.includes(".guide-tab") &&
+                  options?.state === "attached"
+                )
+                  waitedForDom = true;
+              },
+            };
           },
           async queryAll(selector: string) {
             if (!selector.includes(".guide-tab > *")) return [];
@@ -329,5 +339,127 @@ test("course preparation clicks plain child spans inside .guide-tab when AI comp
   } finally {
     repo.close();
     await temp.close();
+  }
+});
+
+test("focus loss after platform auto-advance confirms completion, while transient glitches recover and real loss fails", async (t) => {
+  for (const mode of ["completed-advance", "transient-glitch", "real-loss"]) {
+    const temp = await temporary(),
+      repo = new Repository(temp.dir);
+    const task = repo.upsert(COURSE, `focus-${mode}`);
+    const abort = new AbortController();
+    let progressCalls = 0,
+      snapshotCalls = 0;
+    const section = {
+      id: "sec-focus",
+      resourceId: "res-focus",
+      sectionType: 6,
+      name: "视频节",
+    };
+    const ctx = {
+      repo,
+      lease: { account: task.account, signal: abort.signal },
+      report() {},
+      auth: {
+        assert() {
+          abort.signal.throwIfAborted();
+        },
+        async navigate() {
+          return {
+            async bringToFront() {},
+            async close() {},
+            async queryAll() {
+              return [];
+            },
+            async query() {
+              return null;
+            },
+            async waitForFunction() {},
+            locator() {
+              return {
+                async waitFor() {},
+                async element() {
+                  return {
+                    async evaluate() {
+                      return true;
+                    },
+                  };
+                },
+              };
+            },
+            async evaluate(fn: unknown, arg: any, options: any) {
+              if (fn === playbackSnapshot) {
+                snapshotCalls++;
+                const focused =
+                  mode === "transient-glitch"
+                    ? snapshotCalls !== 1
+                    : snapshotCalls === 0;
+                return {
+                  focused,
+                  media: {
+                    time: 10,
+                    duration: 100,
+                    paused: false,
+                    ended: false,
+                    readyState: 4,
+                    error: false,
+                  },
+                };
+              }
+              if (typeof arg === "string") return true;
+              if (options?.world === "isolated") return "synthetic-token";
+              return { title: "课程", notices: [], challenge: false };
+            },
+            async fetch(url: string) {
+              if (url.includes("/info/"))
+                return {
+                  status: 200,
+                  ok: true,
+                  body: JSON.stringify({
+                    id: task.businessId,
+                    courseChapters: [{ courseChapterSections: [section] }],
+                  }),
+                };
+              progressCalls++;
+              const done =
+                (mode === "completed-advance" && progressCalls >= 2) ||
+                (mode === "transient-glitch" && progressCalls >= 3);
+              return {
+                status: 200,
+                ok: true,
+                body: JSON.stringify([
+                  {
+                    courseId: task.businessId,
+                    sectionId: section.id,
+                    resourceId: section.resourceId,
+                    finishStatus: done ? 2 : 0,
+                  },
+                ]),
+              };
+            },
+          };
+        },
+      },
+    } as unknown as DiscoveryContext;
+    t.mock.timers.enable({ apis: ["Date"], now: 0 });
+    try {
+      await learn(
+        task,
+        ctx,
+        { ...configuration(undefined, temp.dir), watchSlice: 1 },
+        () => {},
+      );
+      const saved = repo.task(task.id);
+      if (mode === "real-loss") {
+        assert.equal(saved.status, "NEEDS_REVIEW");
+        assert.equal(saved.details.sections[0].message, "当前章节焦点已变化");
+      } else {
+        assert.equal(saved.status, "COMPLETED");
+      }
+    } finally {
+      t.mock.timers.reset();
+      repo.close();
+      await temp.close();
+    }
   }
 });

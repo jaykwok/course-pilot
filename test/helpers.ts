@@ -1,7 +1,10 @@
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import type { InputReport } from "nodriver-ts";
-import { ScriptedChrome } from "nodriver-ts/testing";
+import {
+  createInputReport,
+  ScriptedChrome,
+  type InputReportOverrides,
+} from "nodriver-ts/testing";
 import {
   BrowserRuntime,
   enforceSilentCdp,
@@ -11,36 +14,12 @@ import { Repository } from "../src/storage/repository.ts";
 import { Logger } from "../src/log.ts";
 import { Application } from "../src/application/runtime.ts";
 import { configuration, ROOT } from "../src/config.ts";
-export function inputReport(overrides: Partial<InputReport> = {}): InputReport {
-  return {
+export function inputReport(overrides: InputReportOverrides = {}) {
+  return createInputReport({
     action: "click",
     status: "interrupted",
-    seed: 1,
-    randomState: 1,
-    completedSegments: 0,
-    events: 0,
-    dispatched: 0,
-    sent: {
-      moves: 0,
-      wheels: 0,
-      presses: 0,
-      keys: 0,
-      characters: 0,
-      releases: 0,
-      text: 0,
-      composition: 0,
-    },
-    skippedMoves: 0,
-    lateReplies: 0,
-    presentationRecoveries: 0,
-    plannedMs: 0,
-    actualMs: 0,
-    trace: [],
-    cleanupErrors: [],
-    phase: "done",
-    cleanup: "completed",
     ...overrides,
-  };
+  });
 }
 export async function temporary() {
   const parent = join(ROOT, "build", "test-tmp");

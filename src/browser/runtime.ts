@@ -9,8 +9,6 @@ import {
   type Tab,
   type TabScope as BrowserTabScope,
 } from "nodriver-ts";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
 import { prepareProjectProfile } from "./profile.ts";
 import type { Logger } from "../log.ts";
 const loopback = (host: string) =>
@@ -41,25 +39,12 @@ export async function executable(override?: string): Promise<string> {
       );
     }
   }
-  if (!process.env.CHROME_PATH && process.platform === "win32") {
-    const edge = [
-      join(
-        process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)",
-        "Microsoft/Edge/Application/msedge.exe",
-      ),
-      join(
-        process.env.ProgramFiles || "C:\\Program Files",
-        "Microsoft/Edge/Application/msedge.exe",
-      ),
-      join(
-        process.env.LOCALAPPDATA || "",
-        "Microsoft/Edge/Application/msedge.exe",
-      ),
-    ].find((p) => existsSync(p));
-    if (edge) return edge;
-  }
   try {
-    return await findExecutable();
+    return await findExecutable(
+      !process.env.CHROME_PATH && process.platform === "win32"
+        ? { prefer: ["edge", "chrome", "chromium"] }
+        : undefined,
+    );
   } catch {
     throw new Error("未找到浏览器，请安装 Microsoft Edge 或 Google Chrome");
   }
@@ -114,12 +99,12 @@ export class BrowserRuntime {
         supervised: true,
         timeout: 30000,
         preset: "agent",
+        windowSize: { width: 1366, height: 900 },
         args: [
           "--disable-background-timer-throttling",
           "--disable-extensions",
           "--disable-sync",
           "--profile-directory=Default",
-          "--window-size=1366,900",
           "--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWebRTC,msForceBrowserSignIn,msImplicitSignin,msEdgeOnRampFRE",
         ],
         onError: (e) => logger.log(e, "warn"),

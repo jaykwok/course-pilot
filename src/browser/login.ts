@@ -2,7 +2,6 @@ import {
   ActionabilityError,
   InputActionError,
   isContextGone,
-  ProtocolError,
   SessionEndedError,
   StaleElementError,
   TimeoutError,
@@ -105,13 +104,7 @@ export async function applyLoginPreferences(tab: Tab, signal: AbortSignal) {
         error instanceof ActionabilityError ||
         error instanceof TimeoutError ||
         isContextGone(error) ||
-        (error instanceof SessionEndedError && !tab.closed) ||
-        (error instanceof ProtocolError &&
-          ((error.method === "DOM.scrollIntoViewIfNeeded" &&
-            error.protocolMessage.includes(
-              "Node does not have a layout object",
-            )) ||
-            /no frame with given id/i.test(error.protocolMessage)))
+        (error instanceof SessionEndedError && !tab.closed)
       )
         continue;
       throw error;

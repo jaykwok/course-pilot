@@ -1,7 +1,6 @@
 import {
   InputActionError,
   isContextGone,
-  ProtocolError,
   SessionEndedError,
   StaleElementError,
   TimeoutError,
@@ -123,9 +122,7 @@ export async function waitForCasePoolSession(
         error instanceof TimeoutError ||
         error instanceof StaleElementError ||
         isContextGone(error) ||
-        (error instanceof SessionEndedError && !tab.closed) ||
-        (error instanceof ProtocolError &&
-          /no frame with given id/i.test(error.protocolMessage))
+        (error instanceof SessionEndedError && !tab.closed)
       )
         continue;
       throw error;

@@ -138,6 +138,50 @@ export async function platformChecks(runtime: BrowserRuntime) {
         ctx,
       );
     assert.equal(await tab.evaluate(() => document.body.dataset.clicks), "1");
+    await tab.setContent(`
+      <div class="chapter-list jspScrollable" style="width:360px;height:400px;margin:200px 0 0 800px">
+        <div class="jspContainer" style="position:relative;overflow:scroll;width:360px;height:400px">
+          <div class="jspPane" style="position:absolute;top:0px;left:0px;width:340px">
+            <div style="height:5200px"></div>
+            <dl class="chapter-list-box" id="D201show-sectionsdeep-jsp-row">
+              <dt class="section-item-wrapper" style="height:24px" onclick="document.body.dataset.jspTrusted=String(event.isTrusted);this.parentElement.classList.add('focus')">深层章节</dt>
+            </dl>
+            <div style="height:400px"></div>
+          </div>
+        </div>
+      </div>
+      <script>
+        const scrollable = document.querySelector('.chapter-list');
+        const container = document.querySelector('.jspContainer');
+        const pane = document.querySelector('.jspPane');
+        let posY = 0;
+        const jsp = {
+          scrollToY(y) {
+            posY = Math.max(0, Math.min(5400, y));
+            pane.style.top = (-posY) + 'px';
+          },
+        };
+        window.$ = (el) => ({ data: (key) => (el === scrollable && key === 'jsp' ? jsp : null) });
+        // Simulate jScrollPane autoReinitialise resetting native container.scrollTop every 80ms.
+        setInterval(() => {
+          container.scrollTop = 0;
+          pane.style.top = (-posY) + 'px';
+        }, 80);
+      </script>
+    `);
+    await activate(
+      tab,
+      { id: "deep-jsp-row", resourceId: "res-deep", sectionType: 6 },
+      ctx,
+    );
+    assert.deepEqual(
+      await tab.evaluate(() => ({
+        trusted: document.body.dataset.jspTrusted,
+        scrollTop: (document.querySelector(".jspContainer") as HTMLElement)
+          .scrollTop,
+      })),
+      { trusted: "true", scrollTop: 0 },
+    );
     await tab.setContent(
       '<title>Player fixture</title><div style="height:1200px"></div><button id="play" onclick="this.dataset.trusted=String(event.isTrusted)">播放</button>',
     );
