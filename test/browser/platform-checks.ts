@@ -78,7 +78,7 @@ export async function platformChecks(runtime: BrowserRuntime) {
       );
     }
     await tab.setContent(
-      `<title>专题</title><a href="${topic}" onclick="document.body.dataset.navigation='clicked';return false"><span>更多</span></a><a href="${course}">课程</a><button onclick="document.body.dataset.expanded=String(event.isTrusted);this.remove()">加载更多</button>`,
+      `<title>专题</title><a href="${topic}" onclick="document.body.dataset.navigation='clicked';return false"><span>更多</span></a><a href="${course}">课程</a><div class="disabled-wrap"><button disabled style="pointer-events:none">加载更多</button></div><div class="more-wrap"><button onclick="document.body.dataset.expanded=String(event.isTrusted);this.closest('.more-wrap').remove()"><span style="pointer-events:none">加载更多</span></button></div>`,
     );
     const manifest = await catalogManifest(tab, {
       lease: { signal },

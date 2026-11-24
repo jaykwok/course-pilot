@@ -80,6 +80,8 @@ test("native course entrance links retain source identity when pasted or dedupli
   for (const url of [
     `${native}/5/1/${source}`,
     `${native}&0/5/1/${source}`,
+    `${native.replace("11&", "11%26")}/5/1/${source}`,
+    `${native.replace("11&", "11%26")}%260/5/1/${source}`,
     `${native}?type=5&required=1&sourceId=${source}`,
   ]) {
     assert.equal(normalize(url), canonical);
@@ -95,6 +97,7 @@ test("native course entrance links retain source identity when pasted or dedupli
     `${native}/5/1/${source}?sourceId=${entry(EXAM, "a").businessId}`,
     `${native}/5/1/broken`,
     `${native}&1/5/1/${source}`,
+    `${native.replace("11&", "11%26")}%261/5/1/${source}`,
     native.replace("11&", "11&not-an-id&"),
   ])
     assert.throws(() => normalize(invalid));
@@ -116,15 +119,29 @@ test("preview and platform alias routes normalize to canonical resource identiti
     `https://kc.zhixueyun.com/#/study/course/preview/${courseId}/1234567890`,
     `https://kc.zhixueyun.com/#/study/course/preview/11&${courseId}`,
     `https://kc.zhixueyun.com/#/study/course/detail/11@@${courseId}&lang=cn`,
+    `https://kc.zhixueyun.com/#/study/course/${courseId}`,
+    `https://kc.zhixueyun.com/#/study/course/${courseId}/`,
+    `https://kc.zhixueyun.com/#/study/course/11%26${courseId}`,
   ]) {
     assert.equal(normalize(url), COURSE, url);
     assert.equal(entry(url, "a").kind, "course", url);
     assert.equal(entry(url, "a").id, entry(COURSE, "a").id, url);
   }
+  assert.equal(
+    entry("https://kc.zhixueyun.com/#/study/course/list", "a").kind,
+    "entry",
+  );
+  assert.throws(() =>
+    normalize(
+      `https://kc.zhixueyun.com/#/study/course/11%26${courseId}%261/5/1/${classId}`,
+    ),
+  );
   for (const url of [
     `https://kc.zhixueyun.com/#/study/course/preview/${courseId}/5/1/${classId}`,
     `https://kc.zhixueyun.com/#/study/course/preview/${courseId}?type=5&required=1&sourceId=${classId}`,
     `https://kc.zhixueyun.com/#/study/course/detail/11@@${courseId}/5/1/${classId}`,
+    `https://kc.zhixueyun.com/#/study/course/${courseId}/5/1/${classId}`,
+    `https://kc.zhixueyun.com/#/study/course/11%26${courseId}?type=5&required=1&sourceId=${classId}`,
   ]) {
     assert.equal(normalize(url), sourced, url);
     assert.equal(entry(url, "a").id, entry(sourced, "a").id, url);

@@ -223,3 +223,111 @@ test("document elapsed time and unknown media duration never become a fabricated
     assert.equal(buffering.state, "buffering");
   }
 });
+
+test("course preparation clicks plain child spans inside .guide-tab when AI companion tab is active", async () => {
+  const temp = await temporary(),
+    repo = new Repository(temp.dir);
+  const task = repo.upsert(COURSE, "guide-tab-test");
+  const abort = new AbortController();
+  let selected: "ai" | "course" = "ai";
+  let clicks = 0;
+  let waitedForDom = false;
+  const ctx = {
+    repo,
+    lease: { account: task.account, signal: abort.signal },
+    report() {},
+    auth: {
+      assert() {
+        abort.signal.throwIfAborted();
+      },
+      async navigate() {
+        return {
+          async bringToFront() {},
+          async close() {},
+          async query() {
+            return null;
+          },
+          async waitForFunction(fn: Function) {
+            if (fn.toString().includes(".guide-tab")) waitedForDom = true;
+          },
+          async queryAll(selector: string) {
+            if (!selector.includes(".guide-tab > *")) return [];
+            const candidates = [
+              {
+                text: "课程学习",
+                selected: selected === "course",
+                click: async () => {
+                  clicks++;
+                  selected = "course";
+                },
+              },
+              {
+                text: "AI伴学",
+                selected: selected === "ai",
+                click: async () => {
+                  selected = "ai";
+                },
+              },
+            ].filter((item) => !item.selected);
+            return candidates.map((item) => ({
+              async evaluate() {
+                return { text: item.text, disabled: false };
+              },
+              click: item.click,
+            }));
+          },
+          async evaluate(fn: unknown, arg: any, options: any) {
+            if (fn === playbackSnapshot) return { focused: true, media: null };
+            if (typeof arg === "string") return true;
+            if (options?.world === "isolated") return "synthetic-token";
+            return { title: "课程", notices: [], challenge: false };
+          },
+          async fetch(url: string) {
+            if (url.includes("/info/"))
+              return {
+                status: 200,
+                ok: true,
+                body: JSON.stringify({
+                  id: task.businessId,
+                  courseChapters: [
+                    {
+                      courseChapterSections: [
+                        {
+                          id: "sec-1",
+                          resourceId: "res-1",
+                          sectionType: 6,
+                          name: "视频",
+                        },
+                      ],
+                    },
+                  ],
+                }),
+              };
+            return {
+              status: 200,
+              ok: true,
+              body: JSON.stringify([
+                {
+                  courseId: task.businessId,
+                  sectionId: "sec-1",
+                  resourceId: "res-1",
+                  finishStatus: 2,
+                },
+              ]),
+            };
+          },
+        };
+      },
+    },
+  } as unknown as DiscoveryContext;
+  try {
+    await learn(task, ctx, configuration(undefined, temp.dir), () => {});
+    assert.equal(waitedForDom, true);
+    assert.equal(selected, "course");
+    assert.equal(clicks, 1);
+    assert.equal(repo.task(task.id).status, "COMPLETED");
+  } finally {
+    repo.close();
+    await temp.close();
+  }
+});

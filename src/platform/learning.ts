@@ -1,7 +1,7 @@
 import { ActionabilityError, InputActionError, type Tab } from "nodriver-ts";
 import type { Configuration } from "../config.ts";
 import type { Task } from "../storage/repository.ts";
-import { entry, resource } from "../domain/identity.ts";
+import { resource } from "../domain/identity.ts";
 import { PlatformHttp } from "../browser/http.ts";
 import {
   data,
@@ -112,19 +112,36 @@ export async function progress(
     sections,
   );
 }
+async function selectCourseTab(tab: Tab, ctx: DiscoveryContext) {
+  ctx.auth.assert(ctx.lease);
+  await clickText(
+    tab,
+    ["课程学习"],
+    ctx.lease.signal,
+    '.guide-tab > *:not(.guide-tab--selected),.guide-tab span:not(.guide-tab--selected),.guide-tab button:not(.guide-tab--selected),.guide-tab a:not(.guide-tab--selected),.guide-tab--item:not(.guide-tab--selected),[class*="guide-tab"]:not(.guide-tab--selected)',
+    () => ctx.auth.assert(ctx.lease),
+  );
+}
 async function prepare(tab: Tab, ctx: DiscoveryContext) {
+  await tab
+    .waitForFunction(
+      () =>
+        document.querySelector(
+          'dl.chapter-list-box,.guide-tab,.study-transition-page,.register-mask-layer,.error-page,.access-denied,.ant-result,.el-result,[role="alert"],[role="dialog"],.ant-modal-content,.el-dialog',
+        ) !== null,
+      undefined,
+      { timeout: 10000, signal: ctx.lease.signal },
+    )
+    .catch((e) => {
+      if (ctx.lease.signal.aborted) throw e;
+    });
   await inspectAccess(tab, ctx.lease.signal);
   ctx.auth.assert(ctx.lease);
   await continueArchivedCourse(tab, ctx.lease.signal, () =>
     ctx.auth.assert(ctx.lease),
   );
   await dismissOverlays(tab, ctx.lease.signal);
-  await clickText(
-    tab,
-    ["课程学习"],
-    ctx.lease.signal,
-    '.guide-tab,.guide-tab--item,[class*="guide-tab"]',
-  );
+  await selectCourseTab(tab, ctx);
 }
 async function rating(tab: Tab, ctx: DiscoveryContext) {
   ctx.auth.assert(ctx.lease);
@@ -169,6 +186,7 @@ async function rating(tab: Tab, ctx: DiscoveryContext) {
 export async function activate(tab: Tab, s: Section, ctx: DiscoveryContext) {
   await rating(tab, ctx);
   await dismissOverlays(tab, ctx.lease.signal);
+  await selectCourseTab(tab, ctx);
   const selector = `dl.chapter-list-box[id$="${s.id}"]`;
   const row = tab.locator(`${selector} .section-item-wrapper`);
   const focused = () =>
@@ -266,24 +284,7 @@ export async function learn(
 ) {
   if (task.kind !== "course") {
     await discover([task.url], ctx);
-    if (task.kind === "entry") {
-      let canonical;
-      try {
-        if (entry(task.url, task.account).id !== task.id)
-          canonical = ctx.repo.upsert(task.url, task.account);
-      } catch {}
-      if (canonical && canonical.id !== task.id) {
-        for (const row of ctx.repo.db
-          .prepare("SELECT parent,required FROM edges WHERE child=?")
-          .all(task.id))
-          ctx.repo.link(
-            ctx.repo.task(String(row.parent)),
-            canonical,
-            !!row.required,
-          );
-        ctx.repo.discardEntry(task, "入口已规范化为直接学习资源");
-      }
-    }
+    if (task.kind === "entry") ctx.repo.migrateEntry(task);
     if (
       task.kind === "subject" &&
       !ctx.repo.hasFailure(task.id) &&

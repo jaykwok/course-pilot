@@ -145,16 +145,25 @@ export function normalize(raw: string): string {
       continue;
     }
     const route = url.hash.split("?")[0];
-    const course = route.match(/^#\/study\/course\/(detail|preview)\/([^/]+)(.*)$/i);
+    const decodeRouteId = (segment: string) =>
+      segment
+        .replace(/%26/gi, "&")
+        .replace(/%40/gi, "@")
+        .replace(/&lang=[ce]n$/i, "");
+    const course =
+      route.match(/^#\/study\/course\/(detail|preview)\/([^/]+)(.*)$/i) ||
+      route.match(
+        /^#\/study\/course\/()((?:[1-9]\d*(?:&|%26|@@|%40%40))?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:(?:&|%26)[01])?(?:(?:&|%26)lang=[ce]n)?)(\/.*)?$/i,
+      );
     if (course) {
       const mode = course[1].toLowerCase();
       // Native course links prefix the resource ID with an entrance number.
       // &0 is the non-preview variant; preview context cannot be reconstructed.
-      const rawId = course[2].replace(/&lang=[ce]n$/i, "");
+      const rawId = decodeRouteId(course[2]);
       const native = rawId.match(/^[1-9]\d*(?:&|@@)([0-9a-f-]{36})(?:&0)?$/i);
       const courseId = native?.[1] || rawId;
       if (!UUID.test(courseId)) throw new Error("平台资源 ID 无效");
-      const suffix = course[3].replace(/\/$/, "");
+      const suffix = (course[3] || "").replace(/\/$/, "");
       const context = suffix.match(/^\/([1-9]\d*)\/([01])\/([\w-]+)$/);
       const previewQualifier =
         mode === "preview" &&
@@ -193,7 +202,7 @@ export function normalize(raw: string): string {
     );
     if (subject) {
       const mode = subject[1].toLowerCase();
-      const rawId = subject[2].replace(/&lang=[ce]n$/i, "");
+      const rawId = decodeRouteId(subject[2]);
       const prefixed = rawId.match(/^[1-9]\d*(?:&|@@)([0-9a-f-]{36})$/i);
       const subjectId = prefixed?.[1] || rawId;
       if (!UUID.test(subjectId)) throw new Error("平台资源 ID 无效");
@@ -207,7 +216,7 @@ export function normalize(raw: string): string {
       /^#\/train-new\/(class-detail(?:-preview)?|class-preview)\/([^/]+)(.*)$/i,
     );
     if (trainClass) {
-      const rawId = trainClass[2].replace(/&lang=[ce]n$/i, "");
+      const rawId = decodeRouteId(trainClass[2]);
       const prefixed = rawId.match(/^[1-9]\d*@@([0-9a-f-]{36})$/i);
       const classIdFromRoute = prefixed?.[1] || rawId;
       if (!UUID.test(classIdFromRoute)) throw new Error("平台资源 ID 无效");
@@ -219,7 +228,7 @@ export function normalize(raw: string): string {
       /^#\/exam\/(?:exam\/)?(answer-paper|exam-detail)\/([^/]+)(.*)$/i,
     );
     if (exam) {
-      const rawId = exam[2].replace(/&lang=[ce]n$/i, "");
+      const rawId = decodeRouteId(exam[2]);
       const prefixed = rawId.match(/^[1-9]\d*@@([0-9a-f-]{36})$/i);
       const examId = prefixed?.[1] || rawId;
       if (!UUID.test(examId)) throw new Error("平台资源 ID 无效");

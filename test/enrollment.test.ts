@@ -636,7 +636,9 @@ test("class external URL activities (type 11) resolve businessValue via PAAS and
     ]);
     const urls = result.found.map((t) => t.url);
     assert.ok(urls.includes(classCourse));
-    assert.ok(urls.includes(`${resource("course", linkedCourseId, subjectId, 1)}`));
+    assert.ok(
+      urls.includes(`${resource("course", linkedCourseId, subjectId, 1)}`),
+    );
     const edge = f.repo.db
       .prepare("SELECT required FROM edges WHERE parent=? AND child=?")
       .get(f.repo.upsert(classUrl, "a").id, f.repo.upsert(SUBJECT, "a").id);
@@ -675,11 +677,14 @@ test("unfinished required class external URL activities still queue linked cours
         };
       },
       paasActivities() {
-        if (paasDown) return { status: 500, value: { message: "server error" } };
+        if (paasDown)
+          return { status: 500, value: { message: "server error" } };
         return {
           status: 200,
           value: {
-            items: [{ id: "ext-req", businessType: 11, businessValue: SUBJECT }],
+            items: [
+              { id: "ext-req", businessType: 11, businessValue: SUBJECT },
+            ],
             recordCount: 2,
           },
         };
@@ -709,9 +714,439 @@ test("unfinished required class external URL activities still queue linked cours
         !paasDown,
       );
       if (!paasDown)
-        assert.match(result.issues[0].message, /必修外链活动尚未在平台确认完成/);
+        assert.match(
+          result.issues[0].message,
+          /必修外链活动尚未在平台确认完成/,
+        );
     } finally {
       await f.close();
     }
+  }
+});
+
+test("re-discovering an upgraded class downgrades legacy required external-URL edges so completed classes finish", async () => {
+  const f = await fixture({
+    status: 5,
+    activities() {
+      return {
+        status: 200,
+        value: {
+          items: [
+            {
+              id: "ext-done",
+              businessType: 11,
+              businessValue: COURSE,
+              required: 1,
+              classStudentActivityProgress: { finishStatus: 1, status: 4 },
+            },
+          ],
+          recordCount: 1,
+        },
+      };
+    },
+  });
+  try {
+    const classTask = f.repo.upsert(classUrl, "a");
+    const targetCourse = f.repo.upsert(COURSE, "a");
+    // Simulate a pre-upgrade DB where the URL destination was linked as required=1.
+    f.repo.link(classTask, targetCourse, true);
+    f.repo.outcome(classTask.id, "WAITING_CHILDREN", {
+      discoveryComplete: true,
+      ownDiscoveryComplete: true,
+    });
+    const result = await discover([classUrl], f.ctx);
+    assert.equal(result.complete, true);
+    const edge = f.repo.db
+      .prepare("SELECT required FROM edges WHERE parent=? AND child=?")
+      .get(classTask.id, targetCourse.id);
+    assert.equal(edge?.required, 0);
+    assert.equal(f.repo.task(classTask.id).status, "COMPLETED");
+    assert.equal(f.repo.task(targetCourse.id).status, "READY");
+    assert.ok(f.repo.queue("a", "learn").some((t) => t.id === targetCourse.id));
+  } finally {
+    await f.close();
+  }
+});
+
+test("incomplete class discovery preserves existing required edges", async () => {
+  const f = await fixture({
+    status: 5,
+    activities() {
+      return {
+        status: 200,
+        value: {
+          items: [
+            {
+              id: "ext-done",
+              businessType: 11,
+              businessValue: COURSE,
+              required: 0,
+              classStudentActivityProgress: { finishStatus: 1, status: 4 },
+            },
+            {
+              id: "manual",
+              businessType: 2,
+              required: 1,
+            },
+          ],
+          recordCount: 2,
+        },
+      };
+    },
+  });
+  try {
+    const classTask = f.repo.upsert(classUrl, "a");
+    const targetCourse = f.repo.upsert(COURSE, "a");
+    f.repo.link(classTask, targetCourse, true);
+    const result = await discover([classUrl], f.ctx);
+    assert.equal(result.complete, false);
+    const edge = f.repo.db
+      .prepare("SELECT required FROM edges WHERE parent=? AND child=?")
+      .get(classTask.id, targetCourse.id);
+    assert.equal(edge?.required, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("class businessValue with percent-encoded %26 entrance prefix, encoded hash query, encoded query values and nested redirects still enqueues courses", async () => {
+  const c1 = "11111111-1111-4111-8111-111111111111";
+  const c2 = "22222222-2222-4222-8222-222222222222";
+  const c3 = "33333333-3333-4333-8333-333333333333";
+  const c4 = "44444444-4444-4444-8444-444444444444";
+  const c5 = "55555555-5555-4555-8555-555555555555";
+  const c6 = "66666666-6666-4666-8666-666666666666";
+  const c7 = "77777777-7777-4777-8777-777777777777";
+  const c8 = "88888888-8888-4888-8888-888888888888";
+  const f = await fixture({
+    status: 5,
+    activities() {
+      return {
+        status: 200,
+        value: {
+          items: [
+            {
+              id: "encoded-amp",
+              businessType: 8,
+              required: 1,
+              businessValue: `https://kc.zhixueyun.com/#/study/course/detail/11%26${c1}/5/1/${classId}`,
+            },
+            {
+              id: "fully-encoded",
+              businessType: 8,
+              required: 1,
+              businessValue: encodeURIComponent(
+                `https://kc.zhixueyun.com/#/study/course/detail/11&${c2}/5/1/${classId}`,
+              ),
+            },
+            {
+              id: "nested-redirect",
+              businessType: 8,
+              required: 1,
+              businessValue: `https://center.mylearning.cn/sso?redirectUrl=${encodeURIComponent(`https://kc.zhixueyun.com/#/study/course/detail/11%26${c3}/5/1/${classId}`)}`,
+            },
+            {
+              id: "encoded-query-value",
+              businessType: 8,
+              required: 1,
+              businessValue: `https://kc.zhixueyun.com/#/study/course/detail/11%26${c4}/5/1/${classId}?title=foo%20%26required%3D0`,
+            },
+            {
+              id: "encoded-hash-route-and-query",
+              businessType: 8,
+              required: 1,
+              businessValue: `https://kc.zhixueyun.com/#${encodeURIComponent(`/study/course/detail/11&${c5}?type=5&required=1&sourceId=${classId}&title=foo%20%26required%3D0`)}`,
+            },
+            {
+              id: "encoded-hash-prefix-and-query",
+              businessType: 8,
+              required: 1,
+              businessValue: `https://kc.zhixueyun.com/%23${encodeURIComponent(`/study/course/detail/11&${c6}?type=5&required=1&sourceId=${classId}`)}`,
+            },
+            {
+              id: "encoded-hash-query-separator",
+              businessType: 8,
+              required: 1,
+              businessValue: `https://kc.zhixueyun.com/#/study/course/detail/11%26${c7}%3Ftype%3D5%26required%3D1%26sourceId%3D${classId}`,
+            },
+            {
+              id: "encoded-qmark-in-query-value",
+              businessType: 8,
+              required: 1,
+              businessValue: `https://kc.zhixueyun.com/#/study/course/detail/11%26${c8}?type=5&required=1&sourceId=${classId}&title=foo%3Fbar%26required%3D0`,
+            },
+          ],
+          recordCount: 8,
+        },
+      };
+    },
+  });
+  try {
+    const result = await discover([classUrl], f.ctx);
+    assert.equal(result.complete, true);
+    assert.deepEqual(
+      result.found.map((task) => task.url),
+      [c1, c2, c3, c4, c5, c6, c7, c8].map(
+        (id) =>
+          `https://kc.zhixueyun.com/#/study/course/detail/${id}/5/1/${classId}`,
+      ),
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("class activity URLs with embedded credentials remain rejected even with encoded /%23 paths", async () => {
+  const c1 = "11111111-1111-4111-8111-111111111111";
+  const f = await fixture({
+    status: 5,
+    activities() {
+      return {
+        status: 200,
+        value: {
+          items: [
+            {
+              id: "cred-course",
+              businessType: 8,
+              required: 1,
+              businessValue: `https://user:pass@kc.zhixueyun.com/%23/study/course/detail/${c1}`,
+            },
+            {
+              id: "cred-ext",
+              businessType: 11,
+              required: 0,
+              businessValue: `https://user:pass@kc.zhixueyun.com/%23/study/course/detail/${c1}`,
+              classStudentActivityProgress: { finishStatus: 1, status: 4 },
+            },
+          ],
+          recordCount: 2,
+        },
+      };
+    },
+  });
+  try {
+    const result = await discover([classUrl], f.ctx);
+    assert.equal(result.complete, false);
+    assert.deepEqual(result.found, []);
+    assert.match(result.issues[0].message, /cred-course/);
+    assert.match(result.issues[0].message, /cred-ext.*培训班外链地址无效/);
+  } finally {
+    await f.close();
+  }
+});
+
+test("HTTP and HTTPS aliases merge by task identity so required edges win and upgraded optional edges downgrade", async () => {
+  const httpClassCourse = classCourse.replace("https://", "http://");
+  const httpCourse = COURSE.replace("https://", "http://");
+  const both = await fixture({
+    status: 5,
+    activities() {
+      return {
+        status: 200,
+        value: {
+          items: [
+            {
+              id: "ext-http",
+              businessType: 11,
+              businessValue: httpClassCourse,
+              required: 0,
+              classStudentActivityProgress: { finishStatus: 1, status: 4 },
+            },
+            {
+              id: "req-https",
+              businessType: 8,
+              businessId: entry(COURSE, "a").businessId,
+              required: 1,
+            },
+          ],
+          recordCount: 2,
+        },
+      };
+    },
+  });
+  try {
+    const classTask = both.repo.upsert(classUrl, "a");
+    // Pre-store the task with HTTP URL so child.url differs in scheme from HTTPS.
+    const child = both.repo.upsert(httpClassCourse, "a");
+    both.repo.link(classTask, child, true);
+    const result = await discover([classUrl], both.ctx);
+    assert.equal(result.complete, true);
+    const edge = both.repo.db
+      .prepare("SELECT required FROM edges WHERE parent=? AND child=?")
+      .get(classTask.id, child.id);
+    assert.equal(edge?.required, 1);
+    assert.equal(both.repo.task(classTask.id).status, "WAITING_CHILDREN");
+    assert.equal(both.repo.task(child.id).status, "READY");
+  } finally {
+    await both.close();
+  }
+
+  const upgraded = await fixture({
+    status: 5,
+    activities() {
+      return {
+        status: 200,
+        value: {
+          items: [
+            {
+              id: "ext-https",
+              businessType: 11,
+              businessValue: COURSE,
+              required: 1,
+              classStudentActivityProgress: { finishStatus: 1, status: 4 },
+            },
+          ],
+          recordCount: 1,
+        },
+      };
+    },
+  });
+  try {
+    const classTask = upgraded.repo.upsert(classUrl, "a");
+    // Old DB stored HTTP URL with required=1; new manifest returns HTTPS optional URL.
+    const child = upgraded.repo.upsert(httpCourse, "a");
+    upgraded.repo.link(classTask, child, true);
+    upgraded.repo.outcome(classTask.id, "WAITING_CHILDREN", {
+      discoveryComplete: true,
+      ownDiscoveryComplete: true,
+    });
+    const result = await discover([classUrl], upgraded.ctx);
+    assert.equal(result.complete, true);
+    const edge = upgraded.repo.db
+      .prepare("SELECT required FROM edges WHERE parent=? AND child=?")
+      .get(classTask.id, child.id);
+    assert.equal(edge?.required, 0);
+    assert.equal(upgraded.repo.task(classTask.id).status, "COMPLETED");
+  } finally {
+    await upgraded.close();
+  }
+});
+
+test("class discovery warms up the class page once on cold 422/60111 and still blocks genuine permission denials", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const runCase = async (succeedAfterWarmup: boolean) => {
+    const temp = await temporary(),
+      repo = new Repository(temp.dir);
+    let navigations = 0,
+      chapterCalls = 0;
+    const ctx = {
+      repo,
+      lease: {
+        account: "a",
+        generation: 0,
+        fingerprint: "f",
+        signal: new AbortController().signal,
+      },
+      report() {},
+      auth: {
+        assert() {},
+        async navigate(_scope: unknown, url: string) {
+          navigations++;
+          return {
+            url,
+            closed: false,
+            async close() {},
+            async waitForFunction() {},
+            async evaluate(_fn: unknown, code?: unknown) {
+              if (code === 60111) return "您无权限参加该培训班";
+              if (code !== undefined) return undefined;
+              return "synthetic-token";
+            },
+            async fetch(requestUrl: string) {
+              const path = new URL(requestUrl).pathname;
+              if (path.endsWith("/registrationProgress"))
+                return {
+                  status: 200,
+                  ok: true,
+                  body: JSON.stringify({
+                    code: 0,
+                    data: {
+                      classInfoId: classId,
+                      registerStatus: 5,
+                      classInfoVo: {
+                        payType: 0,
+                        isRegister: 2,
+                        isRegisterReason: 2,
+                        signupFile: 0,
+                      },
+                    },
+                  }),
+                };
+              if (path.endsWith("/chapter")) {
+                chapterCalls++;
+                if (chapterCalls === 1 || !succeedAfterWarmup)
+                  return {
+                    status: 422,
+                    ok: false,
+                    body: JSON.stringify({
+                      errorCode: 60111,
+                      message: "Invalid input.",
+                    }),
+                  };
+                return {
+                  status: 200,
+                  ok: true,
+                  body: JSON.stringify([
+                    {
+                      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                      name: "阶段",
+                    },
+                  ]),
+                };
+              }
+              return {
+                status: 200,
+                ok: true,
+                body: JSON.stringify({
+                  items: [
+                    {
+                      id: "act-1",
+                      businessType: 8,
+                      businessId: entry(COURSE, "a").businessId,
+                      required: 1,
+                    },
+                  ],
+                  recordCount: 1,
+                }),
+              };
+            },
+          };
+        },
+      },
+    } as unknown as DiscoveryContext;
+    try {
+      const pending = discover([classUrl], ctx);
+      for (let i = 0; i < 10; i++) {
+        await new Promise((resolve) => setImmediate(resolve));
+        t.mock.timers.tick(500);
+      }
+      const result = await pending;
+      return { result, navigations, chapterCalls };
+    } finally {
+      repo.close();
+      await temp.close();
+    }
+  };
+  try {
+    const recovered = await runCase(true);
+    assert.equal(recovered.result.complete, true);
+    assert.equal(recovered.navigations, 2);
+    assert.equal(recovered.chapterCalls, 2);
+    assert.deepEqual(
+      recovered.result.found.map((task) => task.url),
+      [classCourse],
+    );
+
+    const denied = await runCase(false);
+    assert.equal(denied.result.complete, false);
+    assert.equal(denied.navigations, 2);
+    assert.equal(denied.chapterCalls, 2);
+    assert.equal(denied.result.issues[0].recovery, "blocked");
+    assert.match(
+      denied.result.issues[0].message,
+      /60111.*您无权限参加该培训班/,
+    );
+  } finally {
+    t.mock.timers.reset();
   }
 });

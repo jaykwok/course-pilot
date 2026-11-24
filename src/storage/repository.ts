@@ -197,6 +197,23 @@ export class Repository {
     });
     for (const row of parents) this.reconcile(String(row.parent));
   }
+  migrateEntry(task: Task): Task | undefined {
+    if (task.kind !== "entry") return undefined;
+    let canonical: Task;
+    try {
+      if (entry(task.url, task.account).id === task.id) return undefined;
+      canonical = this.upsert(task.url, task.account);
+    } catch {
+      return undefined;
+    }
+    if (canonical.id === task.id) return undefined;
+    for (const row of this.db
+      .prepare("SELECT parent,required FROM edges WHERE child=?")
+      .all(task.id))
+      this.link(this.task(String(row.parent)), canonical, !!row.required);
+    this.discardEntry(task, "入口已规范化为直接学习资源");
+    return canonical;
+  }
   outcome(id: string, status: Status, details: Record<string, any> = {}) {
     const merged = { ...this.task(id).details, ...details };
     if (status === "COMPLETED") {
@@ -247,7 +264,7 @@ export class Repository {
     });
     this.refreshParents(task.id);
   }
-  link(parent: Task, child: Task, required = true) {
+  link(parent: Task, child: Task, required = true, overwrite = false) {
     if (parent.account !== child.account) throw new Error("父子任务账号不一致");
     if (parent.id === child.id) return false;
     const cycle = this.db
@@ -258,7 +275,9 @@ export class Repository {
     if (cycle) return false;
     this.db
       .prepare(
-        "INSERT INTO edges VALUES(?,?,?) ON CONFLICT(parent,child) DO UPDATE SET required=max(required,excluded.required)",
+        overwrite
+          ? "INSERT INTO edges VALUES(?,?,?) ON CONFLICT(parent,child) DO UPDATE SET required=excluded.required"
+          : "INSERT INTO edges VALUES(?,?,?) ON CONFLICT(parent,child) DO UPDATE SET required=max(required,excluded.required)",
       )
       .run(parent.id, child.id, required ? 1 : 0);
     return true;

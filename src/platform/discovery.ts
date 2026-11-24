@@ -62,7 +62,8 @@ export function subjectSectionCompleted(
 export function subjectManifest(payload: unknown, subject: Task): Manifest {
   const links: string[] = [];
   const optionalLinks: string[] = [];
-  const requiredLinks = new Set<string>();
+  const requiredIds = new Set<string>();
+  const idOf = (url: string) => entry(url, "manifest").id;
   let complete = true,
     count = 0,
     residual = false;
@@ -83,11 +84,11 @@ export function subjectManifest(payload: unknown, subject: Task): Manifest {
             s.required,
           );
           links.push(url);
-          requiredLinks.add(url);
+          requiredIds.add(idOf(url));
         } else if (Number(s.sectionType) === 9) {
           const url = resource("exam", s.resourceId);
           links.push(url);
-          requiredLinks.add(url);
+          requiredIds.add(idOf(url));
         } else if (Number(s.sectionType) === 3) {
           residual ||= !subjectSectionCompleted(s, subject);
           const destination = new URL(s.url);
@@ -103,9 +104,7 @@ export function subjectManifest(payload: unknown, subject: Task): Manifest {
             isCasePoolUrl(destination)
           ) {
             const destinations = extractLinks([destination.href], subject.url);
-            optionalLinks.push(
-              ...destinations.filter((url) => !links.includes(url)),
-            );
+            optionalLinks.push(...destinations);
             links.push(...destinations);
           }
         } else {
@@ -122,7 +121,7 @@ export function subjectManifest(payload: unknown, subject: Task): Manifest {
     links,
     complete: complete && count > 0,
     residual: residual || !complete || count === 0,
-    optionalLinks: optionalLinks.filter((url) => !requiredLinks.has(url)),
+    optionalLinks: optionalLinks.filter((url) => !requiredIds.has(idOf(url))),
     message: !complete ? "主题仍有无法识别的章节，已保留已发现课程" : undefined,
   };
 }
@@ -140,7 +139,7 @@ export function extractLinks(texts: string[], base: string): string[] {
         return;
       if (raw.startsWith("#") && !raw.startsWith("#/")) return;
       if (
-        /^(?:\/#|#)?\/(?:study\/(?:course|subject)\/(?:detail|preview)|exam\/(?:exam\/)?(?:answer-paper|exam-detail)|train-new\/(?:class-detail(?:-preview)?|class-preview))\//i.test(
+        /^(?:\/#|#)?\/(?:study\/(?:course\/(?:(?:detail|preview)\/)?|subject\/(?:detail|preview)\/)|exam\/(?:exam\/)?(?:answer-paper|exam-detail)\/|train-new\/(?:class-detail(?:-preview)?|class-preview)\/)/i.test(
           raw,
         )
       )
@@ -172,7 +171,7 @@ export function extractLinks(texts: string[], base: string): string[] {
     for (const match of text
       .replace(absolute, "")
       .matchAll(
-        /(?:\/#|#)?\/(?:study\/(?:course|subject)\/(?:detail|preview)|exam\/(?:exam\/)?(?:answer-paper|exam-detail)|train-new\/(?:class-detail(?:-preview)?|class-preview))\/[^\s"'<>`\\{}()]+/gi,
+        /(?:\/#|#)?\/(?:study\/(?:course\/(?:(?:detail|preview)\/)?|subject\/(?:detail|preview)\/)|exam\/(?:exam\/)?(?:answer-paper|exam-detail)\/|train-new\/(?:class-detail(?:-preview)?|class-preview)\/)[^\s"'<>`\\{}()]+/gi,
       ))
       accept(`${PLATFORM}/#${match[0].replace(/^(?:\/#|#)/, "")}`);
   }
@@ -293,20 +292,28 @@ export async function traverse(
         residual: !!manifest.residual,
         ignored: undefined,
       });
-      const optional = new Set(manifest.optionalLinks);
+      const optional = new Set((manifest.optionalLinks || []).map(normalize));
       const relatedEntries: string[] = [];
-      const candidates = [...new Set(manifest.links.map(normalize))]
-        .filter(usable)
-        .filter((url) => {
-          if (inScope(url)) return true;
+      const candidates: Task[] = [];
+      const requiredById = new Map<string, boolean>();
+      for (const url of new Set(manifest.links.map(normalize))) {
+        if (!usable(url)) continue;
+        if (!inScope(url)) {
           relatedEntries.push(url);
           ctx.repo.unlink(task.id, entry(url, ctx.lease.account).id);
           if (!related.has(url))
             ctx.report(`延伸专题未展开，可单独录入：${url}`);
           related.add(url);
-          return false;
-        })
-        .map((url) => ctx.repo.upsert(url, ctx.lease.account));
+          continue;
+        }
+        const child = ctx.repo.upsert(url, ctx.lease.account);
+        const isRequired = !optional.has(url) && child.required !== "0";
+        if (!requiredById.has(child.id)) candidates.push(child);
+        requiredById.set(
+          child.id,
+          (requiredById.get(child.id) ?? false) || isRequired,
+        );
+      }
       ctx.repo.outcome(task.id, "READY", { relatedEntries });
       // Keep the full graph for reachability, including back edges omitted by storage.
       observed.set(task.id, {
@@ -320,7 +327,8 @@ export async function traverse(
           ctx.repo.link(
             task,
             child,
-            !optional.has(child.url) && child.required !== "0",
+            requiredById.get(child.id) ?? true,
+            manifest.complete,
           ),
       );
       // Persist all children before recursively touching another container.
@@ -388,6 +396,20 @@ export async function traverse(
   const tasks = [...new Set(roots.map(normalize))]
     .filter(usable)
     .map((url) => ctx.repo.upsert(url, ctx.lease.account));
+  const retireLegacy = (canonicalIds: ReadonlySet<string>) => {
+    for (const row of ctx.repo.db
+      .prepare(
+        "SELECT DISTINCT t.id FROM tasks t JOIN queues q ON q.task_id=t.id WHERE t.account=? AND t.kind='entry'",
+      )
+      .all(ctx.lease.account)) {
+      const legacy = ctx.repo.task(String(row.id));
+      try {
+        if (canonicalIds.has(entry(legacy.url, legacy.account).id))
+          ctx.repo.migrateEntry(legacy);
+      } catch {}
+    }
+  };
+  retireLegacy(new Set(tasks.map((task) => task.id)));
   for (const task of tasks)
     ctx.repo.enqueue(
       task,
@@ -469,7 +491,9 @@ export async function discover(urls: string[], ctx: DiscoveryContext) {
             task,
           );
         if (task.kind === "class")
-          return await classManifest(await platform(task), task, ctx);
+          return await classManifest(await platform(task), task, ctx, (tab) => {
+            apiTab = tab;
+          });
         catalogTab = await ctx.auth.navigate(
           ctx.scope,
           task.url,
@@ -523,8 +547,36 @@ async function classManifest(
   http: PlatformHttp,
   task: Task,
   ctx: DiscoveryContext,
+  onTab?: (tab: Tab) => void,
 ): Promise<Manifest> {
   const registration = "/gwapi/v1/saas-stu/web-biz/latest/train/class-student";
+  let warmed = false;
+  const readClassSafe = async <T>(
+    fn: (client: PlatformHttp) => Promise<T>,
+  ): Promise<T> => {
+    try {
+      return await fn(http);
+    } catch (error) {
+      if (
+        warmed ||
+        !(error instanceof ReviewRequired) ||
+        error.reason !== "platform_rejected" ||
+        !/错误码\s*60111\b/.test(error.message)
+      )
+        throw error;
+      warmed = true;
+      const tab = await ctx.auth.navigate(
+        ctx.scope,
+        task.url,
+        ctx.lease,
+        http.tab.closed ? undefined : http.tab,
+      );
+      onTab?.(tab);
+      http = new PlatformHttp(tab, ctx.auth, ctx.lease);
+      await sleep(2000, ctx.lease.signal);
+      return await fn(http);
+    }
+  };
   const progress = async () => {
     const result = await http.json(
         `${registration}/registrationProgress?classId=${task.businessId}`,
@@ -560,8 +612,10 @@ async function classManifest(
     blockedStatus();
     // registrationProgress omits the signup dates. The class page's basic
     // endpoint provides the window and server time, even for an expired class.
-    const detail = await http.json(
-      `/api/v1/training/test-student/class-info/safe/front/basic/${task.businessId}`,
+    const detail = await readClassSafe((client) =>
+      client.json(
+        `/api/v1/training/test-student/class-info/safe/front/basic/${task.businessId}`,
+      ),
     );
     const info = data(detail);
     if (
@@ -666,18 +720,52 @@ async function classManifest(
   }
   const prefix = "/api/v1/training/student/class-info/safe";
   const chapters = list(
-    await http.json(`${prefix}/chapter?classId=${task.businessId}`),
+    await readClassSafe((client) =>
+      client.json(`${prefix}/chapter?classId=${task.businessId}`),
+    ),
   );
   if (!chapters.length)
     return { links: [], complete: false, message: "培训班章节清单为空" };
   const links: string[] = [];
   const optionalLinks: string[] = [];
-  const requiredLinks = new Set<string>();
+  const requiredIds = new Set<string>();
+  const idOf = (url: string) => entry(url, "manifest").id;
   const problems: { message: string; recovery: Recovery }[] = [];
   const decodeActivityUrl = (raw: string) => {
     const trimmed = raw.trim();
     try {
-      new URL(trimmed);
+      const parsed = new URL(trimmed);
+      if (
+        ["http:", "https:"].includes(parsed.protocol) &&
+        platformHost(parsed.hostname) &&
+        !parsed.username &&
+        !parsed.password
+      ) {
+        const decodeHash = (body: string) => {
+          const q = body.indexOf("?");
+          if (q < 0 && /%3f/i.test(body)) {
+            try {
+              return decodeURIComponent(body);
+            } catch {}
+          }
+          const route = q < 0 ? body : body.slice(0, q);
+          const query = q < 0 ? "" : body.slice(q);
+          return `${route.replace(/%26/gi, "&").replace(/%2f/gi, "/").replace(/%40/gi, "@")}${query}`;
+        };
+        if (!parsed.hash && /^\/%23(?:%2f|\/)/i.test(parsed.pathname)) {
+          parsed.hash = `#${decodeHash(parsed.pathname.slice(4))}`;
+          parsed.pathname = "/";
+          return parsed.href;
+        }
+        if (parsed.hash) {
+          const body = parsed.hash.slice(1);
+          const decoded = decodeHash(body);
+          if (decoded !== body) {
+            parsed.hash = `#${decoded}`;
+            return parsed.href;
+          }
+        }
+      }
       return trimmed;
     } catch {
       return decodeURIComponent(trimmed);
@@ -698,8 +786,10 @@ async function classManifest(
       for (; page <= 200; page++) {
         // The standard list exposes the total; the PAAS preview/more endpoints
         // report a preview count and zero respectively, not the chapter total.
-        const payload = await http.json(
-          `${prefix}/chapter-activity-list?classId=${task.businessId}&chapterId=${chapter.id}&page=${page}&pageSize=10`,
+        const payload = await readClassSafe((client) =>
+          client.json(
+            `${prefix}/chapter-activity-list?classId=${task.businessId}&chapterId=${chapter.id}&page=${page}&pageSize=10`,
+          ),
         );
         const items = list(payload);
         let added = 0;
@@ -829,9 +919,7 @@ async function classManifest(
             isCasePoolUrl(destination)
           ) {
             const destinations = extractLinks([destination.href], task.url);
-            optionalLinks.push(
-              ...destinations.filter((url) => !links.includes(url)),
-            );
+            optionalLinks.push(...destinations);
             links.push(...destinations);
           }
           const completed =
@@ -848,18 +936,18 @@ async function classManifest(
           );
           links.push(value);
           if (String(item.required) === "0") optionalLinks.push(value);
-          else requiredLinks.add(value);
+          else requiredIds.add(idOf(value));
         } else if (String(item.businessType) === "8") {
           const url = normalize(
             `${resource("course", item.businessId)}/5/${item.required}/${task.businessId}`,
           );
           links.push(url);
-          if (String(item.required) !== "0") requiredLinks.add(url);
+          if (String(item.required) !== "0") requiredIds.add(idOf(url));
         } else if (["1", "7", "9"].includes(String(item.businessType))) {
           const url = resource("exam", item.businessId);
           links.push(url);
           if (String(item.required) === "0") optionalLinks.push(url);
-          else requiredLinks.add(url);
+          else requiredIds.add(idOf(url));
         } else
           throw new ReviewRequired(
             "class_activity_manual",
@@ -876,7 +964,7 @@ async function classManifest(
   }
   return {
     links,
-    optionalLinks: optionalLinks.filter((url) => !requiredLinks.has(url)),
+    optionalLinks: optionalLinks.filter((url) => !requiredIds.has(idOf(url))),
     complete: problems.length === 0,
     message: problems.length
       ? `培训班活动解析未完成：${problems.map((problem) => problem.message).join("；")}`
@@ -971,10 +1059,28 @@ async function expandCatalog(tab: Tab, ctx: DiscoveryContext) {
         (e) => {
           const text = (e.innerText || e.textContent || "").replace(/\s/g, "");
           const link = e.closest("a[href],[onclick],[data-url]");
+          const style = getComputedStyle(e);
+          const interactive = (el: Element) =>
+            el.matches('a,button,[role="button"]');
+          const isDisabled = (el: Element) =>
+            el.matches(':disabled,[aria-disabled="true"]');
+          const visible = (el: Element) => {
+            const rect = el.getBoundingClientRect();
+            const cs = getComputedStyle(el);
+            return (
+              rect.width > 0 &&
+              rect.height > 0 &&
+              cs.visibility !== "hidden" &&
+              cs.display !== "none"
+            );
+          };
           const nested = [...e.querySelectorAll("a,button,span,div,li")].some(
             (child) =>
-              child.getBoundingClientRect().height > 0 &&
-              getComputedStyle(child).visibility !== "hidden" &&
+              visible(child) &&
+              (interactive(child) ||
+                isDisabled(child) ||
+                (!interactive(e) &&
+                  getComputedStyle(child).pointerEvents !== "none")) &&
               (
                 (child as HTMLElement).innerText ||
                 child.textContent ||
@@ -985,8 +1091,9 @@ async function expandCatalog(tab: Tab, ctx: DiscoveryContext) {
             text,
             nested,
             disabled:
+              style.pointerEvents === "none" ||
               e.matches(":disabled") ||
-              e.getAttribute("aria-disabled") === "true",
+              !!e.closest(':disabled,[aria-disabled="true"]'),
             href: link?.getAttribute("href") || "",
             values: ["href", "onclick", "data-url"].map(
               (a) => link?.getAttribute(a) || "",

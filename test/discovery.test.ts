@@ -1344,3 +1344,217 @@ test("retrying a stored preview entry upgrades it to the canonical course withou
     await temp.close();
   }
 });
+
+test("catalog expansion clicks buttons containing pointer-events:none spans and skips outer wrappers and disabled controls", async () => {
+  const root = "https://cms.mylearning.cn/topic/pointer-none.html";
+  const course2 = COURSE.replaceAll("11111111", "22222222");
+  let expanded = false;
+  const clicked: string[] = [];
+
+  type FakeEl = {
+    name: string;
+    tag: string;
+    text: string;
+    disabled?: boolean;
+    pointerEvents?: string;
+    parent?: FakeEl;
+    children: FakeEl[];
+  };
+  const makeDom = (node: FakeEl): any => {
+    const dom: any = {
+      innerText: node.text,
+      textContent: node.text,
+      getBoundingClientRect: () => ({ width: 80, height: 32 }),
+      getAttribute: () => null,
+      matches: (selector: string) =>
+        selector.split(",").some((part) => {
+          const s = part.trim();
+          if (s === ":disabled") return !!node.disabled;
+          if (s === '[aria-disabled="true"]') return false;
+          return s === node.tag;
+        }),
+      closest: (selector: string): any => {
+        for (let cur: FakeEl | undefined = node; cur; cur = cur.parent)
+          if (makeDom(cur).matches(selector)) return makeDom(cur);
+        return null;
+      },
+      querySelectorAll: () => node.children.map(makeDom),
+      _style: {
+        visibility: "visible",
+        display: "inline-block",
+        pointerEvents: node.pointerEvents ?? "auto",
+      },
+    };
+    return dom;
+  };
+
+  const disabledWrap: FakeEl = {
+    name: "disabled-wrap",
+    tag: "div",
+    text: "加载更多",
+    children: [],
+  };
+  const disabledButton: FakeEl = {
+    name: "disabled-btn",
+    tag: "button",
+    text: "加载更多",
+    disabled: true,
+    pointerEvents: "none",
+    parent: disabledWrap,
+    children: [],
+  };
+  const disabledSpan: FakeEl = {
+    name: "disabled-span",
+    tag: "span",
+    text: "加载更多",
+    parent: disabledButton,
+    children: [],
+  };
+  disabledButton.children.push(disabledSpan);
+  disabledWrap.children.push(disabledButton, disabledSpan);
+
+  const wrapper: FakeEl = {
+    name: "wrapper",
+    tag: "div",
+    text: "加载更多",
+    children: [],
+  };
+  const button: FakeEl = {
+    name: "button",
+    tag: "button",
+    text: "加载更多",
+    parent: wrapper,
+    children: [],
+  };
+  const span: FakeEl = {
+    name: "span",
+    tag: "span",
+    text: "加载更多",
+    pointerEvents: "none",
+    parent: button,
+    children: [],
+  };
+  button.children.push(span);
+  wrapper.children.push(button, span);
+
+  const nodes = [
+    disabledWrap,
+    disabledButton,
+    disabledSpan,
+    wrapper,
+    button,
+    span,
+  ];
+  const wrapElement = (node: FakeEl) => ({
+    async evaluate(fn: Function) {
+      return runInNewContext(`(${fn.toString()})(el)`, {
+        el: makeDom(node),
+        getComputedStyle: (target: any) => target._style,
+      });
+    },
+    async click() {
+      clicked.push(node.name);
+      expanded = true;
+    },
+  });
+  const tab = {
+    url: root,
+    async evaluate() {
+      return snapshot(root, expanded ? [COURSE, course2] : [COURSE]);
+    },
+    async queryAll() {
+      return expanded ? [] : nodes.map(wrapElement);
+    },
+  } as unknown as Tab;
+  const ctx = {
+    lease: { signal: new AbortController().signal },
+    auth: { assert() {} },
+  } as unknown as DiscoveryContext;
+  const result = await catalogManifest(tab, ctx);
+  assert.equal(result.complete, true);
+  assert.deepEqual(clicked, ["button"]);
+  assert.deepEqual(result.links, [COURSE, course2]);
+});
+
+test("re-submitting a normalized course retires legacy failed preview and short-route entries", async () => {
+  const temp = await temporary(),
+    repo = new Repository(temp.dir);
+  const courseId = entry(COURSE, "a").businessId;
+  const previewUrl = `https://kc.zhixueyun.com/#/study/course/preview/${courseId}`;
+  const shortUrl = `https://kc.zhixueyun.com/#/study/course/${courseId}`;
+  const parentUrl = "https://cms.mylearning.cn/topic/legacy/pc.html";
+  try {
+    assert.deepEqual(
+      extractLinks(
+        [
+          `<a href="#/study/course/${courseId}">course</a><a href="#/study/course/list">list</a>`,
+        ],
+        parentUrl,
+      ),
+      [COURSE],
+    );
+    const parent = repo.upsert(parentUrl, "a");
+    for (const [legacyId, legacyUrl] of [
+      ["legacy-preview-entry", previewUrl],
+      ["legacy-short-entry", shortUrl],
+    ] as const) {
+      repo.db
+        .prepare(
+          "INSERT INTO tasks(id,account,kind,url,identity,status,details) VALUES(?,?,'entry',?,?,'NEEDS_REVIEW',?)",
+        )
+        .run(
+          legacyId,
+          "a",
+          legacyUrl,
+          JSON.stringify({
+            id: legacyId,
+            account: "a",
+            kind: "entry",
+            url: legacyUrl,
+            businessId: legacyId,
+          }),
+          JSON.stringify({
+            discoveryComplete: false,
+            ownDiscoveryComplete: false,
+            message: "页面展开未完成",
+            recovery: "retry",
+            reason: "discovery_incomplete",
+          }),
+        );
+      repo.db
+        .prepare("INSERT INTO edges(parent,child,required) VALUES(?,?,1)")
+        .run(parent.id, legacyId);
+      repo.db
+        .prepare(
+          "INSERT INTO queues VALUES(?,'failure','discovery_incomplete',1)",
+        )
+        .run(legacyId);
+    }
+    const result = await traverse(
+      [previewUrl],
+      async () => ({ links: [], complete: true }),
+      {
+        repo,
+        lease: { account: "a", signal: new AbortController().signal },
+        report() {},
+      } as unknown as DiscoveryContext,
+    );
+    assert.equal(result.complete, true);
+    assert.deepEqual(
+      result.found.map((task) => task.url),
+      [COURSE],
+    );
+    assert.deepEqual(repo.queue("a", "failure"), []);
+    assert.deepEqual(
+      repo.queue("a", "learn").map((task) => task.url),
+      [COURSE],
+    );
+    const edge = repo.db
+      .prepare("SELECT required FROM edges WHERE parent=? AND child=?")
+      .get(parent.id, entry(COURSE, "a").id);
+    assert.equal(edge?.required, 1);
+  } finally {
+    repo.close();
+    await temp.close();
+  }
+});

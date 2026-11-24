@@ -119,6 +119,7 @@ export class BrowserRuntime {
           "--disable-extensions",
           "--disable-sync",
           "--profile-directory=Default",
+          "--window-size=1366,900",
           "--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWebRTC,msForceBrowserSignIn,msImplicitSignin,msEdgeOnRampFRE",
         ],
         onError: (e) => logger.log(e, "warn"),
