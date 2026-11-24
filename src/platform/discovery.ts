@@ -1,4 +1,11 @@
-import { InputActionError, StaleElementError, type Tab } from "nodriver-ts";
+import {
+  DisconnectedError,
+  InputActionError,
+  InputBlockedError,
+  StaleElementError,
+  type Tab,
+} from "nodriver-ts";
+import { throwIfAccessProblem } from "./dom.ts";
 import { PLATFORM } from "../config.ts";
 import {
   entry,
@@ -358,6 +365,7 @@ export async function traverse(
       if (manifest.complete && childrenComplete) {
         ctx.repo.remove(task.id, "discover");
         ctx.repo.remove(task.id, "failure");
+        if (!manifest.residual) ctx.repo.remove(task.id, "learn");
         ctx.repo.outcome(
           task.id,
           manifest.residual ? "WAITING_SYNC" : "WAITING_CHILDREN",
@@ -382,7 +390,13 @@ export async function traverse(
       else defer(task, "子入口待解析或处理，已发现课程可正常学习");
       return visited.get(task.id)!;
     } catch (e) {
-      if (ctx.lease.signal.aborted || e instanceof AuthenticationError) throw e;
+      if (
+        ctx.lease.signal.aborted ||
+        e instanceof AuthenticationError ||
+        e instanceof DisconnectedError ||
+        e instanceof InputBlockedError
+      )
+        throw e;
       failure(
         task,
         e instanceof Error ? e.message : "入口解析失败",
@@ -534,14 +548,16 @@ export async function discover(urls: string[], ctx: DiscoveryContext) {
             complete: true,
             ignored: "页面返回已解析入口，已停止回流",
           };
-        scanned.add(actual.url);
-        return await catalogManifest(catalogTab, ctx);
+        if (actual.url !== task.url)
+          return { links: [actual.url], complete: true };
+        const result = await catalogManifest(catalogTab, ctx);
+        if (result.complete) scanned.add(actual.url);
+        return result;
       },
       ctx,
     );
   } finally {
-    await apiTab?.close();
-    await catalogTab?.close();
+    await Promise.allSettled([apiTab?.close(), catalogTab?.close()]);
   }
 }
 async function classManifest(
@@ -835,7 +851,13 @@ async function classManifest(
           recovery: "retry",
         });
     } catch (e) {
-      if (ctx.lease.signal.aborted || e instanceof AuthenticationError) throw e;
+      if (
+        ctx.lease.signal.aborted ||
+        e instanceof AuthenticationError ||
+        e instanceof DisconnectedError ||
+        e instanceof InputBlockedError
+      )
+        throw e;
       problems.push({
         message: `${label}第 ${page} 页：${e instanceof Error ? e.message : String(e)}`,
         recovery: failureRecovery(e),
@@ -869,7 +891,9 @@ async function classManifest(
             paasPage === 1
               ? `${prefix}/chapter-activity-list/paas?classId=${task.businessId}&chapterId=${chapter.id}&page=1&pageSize=5`
               : `${prefix}/chapter-activity-list/paas/more?classId=${task.businessId}&chapterId=${chapter.id}&page=${paasPage}&pageSize=5`;
-          const items = list(await http.json(endpoint));
+          const items = list(
+            await readClassSafe((client) => client.json(endpoint)),
+          );
           let added = 0;
           for (const item of items) {
             const key = String(item?.id || "");
@@ -887,7 +911,12 @@ async function classManifest(
             break;
         }
       } catch (e) {
-        if (ctx.lease.signal.aborted || e instanceof AuthenticationError)
+        if (
+          ctx.lease.signal.aborted ||
+          e instanceof AuthenticationError ||
+          e instanceof DisconnectedError ||
+          e instanceof InputBlockedError
+        )
           throw e;
         paasError = e;
       }
@@ -987,6 +1016,8 @@ export interface CatalogSnapshot {
   article: boolean;
   busy: boolean;
   interactive: boolean;
+  challenge?: boolean;
+  notices?: string[];
 }
 /** Read document semantics; no URL, directory name or site-specific class rules. */
 export function catalogSnapshot(): CatalogSnapshot {
@@ -1010,6 +1041,18 @@ export function catalogSnapshot(): CatalogSnapshot {
       ));
   const navigation = performance.getEntriesByType("navigation")[0] as
     PerformanceNavigationTiming | undefined;
+  const challenge = [
+    ...document.querySelectorAll(
+      '#captcha,.captcha-container,.geetest_panel,.geetest_panel_box,.yidun_popup,.nc-container,[data-captcha],input[name*="captcha" i],input[id*="captcha" i],iframe[src*="captcha" i]',
+    ),
+  ].some(visible);
+  const notices = [
+    ...document.querySelectorAll(
+      '[role="alert"],[role="dialog"],.ant-modal-content,.el-dialog,.ant-message-notice-content,.el-message,.error-page,.access-denied,.ant-result,.el-result,h1,h2',
+    ),
+  ]
+    .filter(visible)
+    .map((e) => (e as HTMLElement).innerText.slice(0, 2000));
   return {
     url: location.href,
     title,
@@ -1026,6 +1069,8 @@ export function catalogSnapshot(): CatalogSnapshot {
         'button,input,select,[onclick],[data-url],[role="button"]',
       ),
     ].some(visible),
+    challenge,
+    notices,
   };
 }
 export function catalogPageState(snapshot: CatalogSnapshot) {
@@ -1048,8 +1093,12 @@ export function catalogPageState(snapshot: CatalogSnapshot) {
     return "article";
   return "unknown";
 }
+const EXPAND_SELECTOR = {
+  xpath:
+    ".//*[(self::a or self::button or self::span or self::div or self::li) and (translate(normalize-space(.), ' ', '')='查看更多' or translate(normalize-space(.), ' ', '')='加载更多' or translate(normalize-space(.), ' ', '')='更多' or translate(normalize-space(.), ' ', '')='展开更多' or translate(normalize-space(.), ' ', '')='显示更多')]",
+};
 async function expandCatalog(tab: Tab, ctx: DiscoveryContext) {
-  for (const element of await tab.queryAll("a,button,span,div,li", {
+  for (const element of await tab.queryAll(EXPAND_SELECTOR, {
     visible: true,
     timeout: 5000,
     signal: ctx.lease.signal,
@@ -1153,6 +1202,11 @@ export async function catalogManifest(
         signal: ctx.lease.signal,
       });
       ctx.auth.assert(ctx.lease);
+      throwIfAccessProblem({
+        title: snapshot.title,
+        challenge: snapshot.challenge,
+        notices: snapshot.notices,
+      });
       const links = extractLinks(snapshot.values, snapshot.url);
       const pageState = catalogPageState(snapshot);
       const text = snapshot.text.replace(/\s+/g, " ").trim();
@@ -1201,7 +1255,14 @@ export async function catalogManifest(
       await sleep(1200, ctx.lease.signal);
     } catch (e) {
       if (e instanceof InputActionError) await e.cleanup;
-      if (ctx.lease.signal.aborted || e instanceof AuthenticationError) throw e;
+      if (
+        ctx.lease.signal.aborted ||
+        e instanceof AuthenticationError ||
+        e instanceof DisconnectedError ||
+        e instanceof InputBlockedError ||
+        (e instanceof ReviewRequired && e.recovery === "blocked")
+      )
+        throw e;
       // An expansion failure must not erase links collected before the click.
       message = "页面展开未完成，已发现任务已保留，请重新解析此入口";
       break;
@@ -1302,9 +1363,16 @@ async function casePoolManifest(
           }
           if (typeof r.url === "string") values.push(r.url);
         }
-        const total = d.total == null ? null : Number(d.total);
+        const total =
+          d.total === null || d.total === undefined || d.total === ""
+            ? null
+            : typeof d.total === "boolean"
+              ? NaN
+              : Number(d.total);
+        if (total !== null && (!Number.isSafeInteger(total) || total < 0))
+          throw new Error("分页总数无效");
         if (
-          (total !== null && Number.isFinite(total) && seen.size >= total) ||
+          (total !== null && seen.size >= total) ||
           (total === null && !d.records.length)
         ) {
           ended = true;
@@ -1315,7 +1383,14 @@ async function casePoolManifest(
       if (!ended) throw new Error("分页上限");
     }
     complete = true;
-  } catch {
+  } catch (e) {
+    if (
+      ctx.lease.signal.aborted ||
+      e instanceof AuthenticationError ||
+      e instanceof DisconnectedError ||
+      e instanceof InputBlockedError
+    )
+      throw e;
     ctx.auth.assert(ctx.lease);
   }
   ctx.auth.assert(ctx.lease);

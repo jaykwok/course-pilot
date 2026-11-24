@@ -1,4 +1,13 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  statSync,
+} from "node:fs";
 import { release } from "node:os";
 import { join } from "node:path";
 import { publicSettings } from "../config.ts";
@@ -54,20 +63,64 @@ function safeUrl(raw: string): string {
   }
 }
 
+const SENSITIVE_OUTCOME_KEY =
+  /answer|cookie|token|secret|key|password|authorization|credential|session/i;
+
+function scrubValue(value: unknown, depth = 0): unknown {
+  if (depth > 8 || value == null) return value;
+  if (typeof value === "string") return redact(value);
+  if (Array.isArray(value))
+    return value.slice(0, 200).map((item) => scrubValue(item, depth + 1));
+  if (typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (SENSITIVE_OUTCOME_KEY.test(key)) continue;
+      out[key] = scrubValue(item, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
+
 function sanitizeOutcome(raw: unknown): string {
   if (raw == null) return "";
   try {
     const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const copy: Record<string, unknown> = {};
-      for (const [key, value] of Object.entries(parsed)) {
-        if (/answer|cookie|token|secret|key|password/i.test(key)) continue;
-        copy[key] = value;
-      }
-      return redact(JSON.stringify(copy));
-    }
+    if (parsed && typeof parsed === "object")
+      return redact(JSON.stringify(scrubValue(parsed)));
   } catch {}
   return redact(raw);
+}
+
+function readTailUtf8(path: string, maxBytes: number): string {
+  const fd = openSync(path, "r");
+  try {
+    const size = fstatSync(fd).size;
+    if (size <= 0) return "";
+    const length = Math.min(size, maxBytes);
+    const start = size - length;
+    const buffer = Buffer.allocUnsafe(length);
+    let offset = 0;
+    while (offset < length) {
+      const read = readSync(
+        fd,
+        buffer,
+        offset,
+        length - offset,
+        start + offset,
+      );
+      if (read <= 0) break;
+      offset += read;
+    }
+    let text = buffer.subarray(0, offset).toString("utf8");
+    if (start > 0) {
+      const firstNewline = text.indexOf("\n");
+      if (firstNewline >= 0) text = text.slice(firstNewline + 1);
+    }
+    return text;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function readRecentDiskLogs(
@@ -78,7 +131,13 @@ function readRecentDiskLogs(
 ): string[] {
   if (!existsSync(logsDir)) return [];
   const prefix = `app-${level}`;
-  const files = readdirSync(logsDir)
+  let entries: string[];
+  try {
+    entries = readdirSync(logsDir);
+  } catch {
+    return [];
+  }
+  const files = entries
     .filter((name) => name.startsWith(prefix) && name.endsWith(".log"))
     .map((name) => {
       const full = join(logsDir, name);
@@ -94,10 +153,9 @@ function readRecentDiskLogs(
   const collected: string[] = [];
   let budget = maxBytes;
   for (const file of files) {
-    if (budget <= 0 || collected.length >= maxLines) break;
+    if (budget <= 0 || maxLines - collected.length <= 1) break;
     try {
-      const raw = readFileSync(file.full, "utf8");
-      const slice = raw.length > budget ? raw.slice(-budget) : raw;
+      const slice = readTailUtf8(file.full, budget);
       const lines = slice
         .split(/\r?\n/)
         .map((line) => line.trimEnd())
@@ -106,9 +164,10 @@ function readRecentDiskLogs(
       if (!lines.length) continue;
       collected.push(`--- ${file.name} ---`);
       const remaining = maxLines - collected.length;
+      if (remaining <= 0) break;
       const chosen = lines.length > remaining ? lines.slice(-remaining) : lines;
       collected.push(...chosen);
-      budget -= slice.length;
+      budget -= Buffer.byteLength(slice, "utf8");
     } catch {}
   }
   return collected;
@@ -137,7 +196,28 @@ export function buildDiagnosticLog(options: DiagnosticOptions): {
   const nodriverVersion = readPackageVersion(
     join(root, "node_modules", "nodriver-ts", "package.json"),
   );
-  const settings = publicSettings(settingsPath);
+  let settingsSummary = "";
+  try {
+    const settings = publicSettings(settingsPath);
+    settingsSummary = redact(
+      JSON.stringify({
+        learning: settings.learning,
+        openai: {
+          baseURL: settings.openai.baseURL,
+          model: settings.openai.model,
+          protocol: settings.openai.protocol,
+          output: settings.openai.output,
+          retries: settings.openai.retries,
+          timeout: settings.openai.timeout,
+          totalTimeout: settings.openai.totalTimeout,
+          keyConfigured: settings.openai.keyConfigured,
+        },
+        browser: settings.browser,
+      }),
+    );
+  } catch (error) {
+    settingsSummary = `无法读取设置文件: ${redact(error)}`;
+  }
   const lines: string[] = [];
 
   lines.push("========================================");
@@ -165,9 +245,7 @@ export function buildDiagnosticLog(options: DiagnosticOptions): {
     for (const [k, v] of snapshot.view.summary.rows || [])
       lines.push(`  - ${redact(k)}: ${redact(v)}`);
   }
-  lines.push(
-    `脱敏配置: ${redact(JSON.stringify({ learning: settings.learning, openai: { baseURL: settings.openai.baseURL, model: settings.openai.model, protocol: settings.openai.protocol, output: settings.openai.output, retries: settings.openai.retries, timeout: settings.openai.timeout, totalTimeout: settings.openai.totalTimeout, keyConfigured: settings.openai.keyConfigured }, browser: settings.browser }))}`,
-  );
+  lines.push(`脱敏配置: ${settingsSummary}`);
 
   lines.push("");
   lines.push("=== 异常任务与失败详情 ===");

@@ -102,6 +102,10 @@ interface LocalQueues {
 let localKind: LocalDialogKind;
 let localRequest = 0;
 let localRefreshRequest: number | null = null;
+let lastFailedQueueRevision: number | null = null;
+let settingsRequest = 0;
+let reconnectTimer = 0;
+let reconnectDelay = 1500;
 let localQueues: LocalQueues = {
   revision: -1,
   currentAccount: "",
@@ -183,7 +187,31 @@ function triggerDownload(filename: string, content: BlobPart, type: string) {
   document.body.append(link);
   link.click();
   link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  setTimeout(() => URL.revokeObjectURL(url), 15000);
+}
+
+const OFFLINE_SENSITIVE_PARAM =
+  /token|authorization|cookie|password|secret|^(?:code|ticket|bootstrap|key|api[_-]?key|sso_?ticket|auth_?code|access_?key|session_?id|sid|signature|sig)$/i;
+
+function sanitizeOfflineUrl(raw: string): string {
+  try {
+    const url = new URL(raw);
+    for (const key of [...url.searchParams.keys()]) {
+      if (OFFLINE_SENSITIVE_PARAM.test(key)) url.searchParams.delete(key);
+    }
+    const hashQuery = url.hash.indexOf("?");
+    if (hashQuery >= 0) {
+      const params = new URLSearchParams(url.hash.slice(hashQuery + 1));
+      for (const key of [...params.keys()]) {
+        if (OFFLINE_SENSITIVE_PARAM.test(key)) params.delete(key);
+      }
+      url.hash =
+        url.hash.slice(0, hashQuery) + (params.size ? `?${params}` : "");
+    }
+    return url.href;
+  } catch {
+    return raw;
+  }
 }
 
 function buildOfflineDiagnosticLog(reason: string): string {
@@ -209,15 +237,16 @@ function buildOfflineDiagnosticLog(reason: string): string {
     for (const [k, v] of state.summary.rows || [])
       lines.push(`  - ${k}: ${String(v ?? "")}`);
   }
-  if (localQueues.accounts.length) {
+  const allFailures = localQueues.accounts.flatMap(
+    (account) => account.failures,
+  );
+  if (allFailures.length) {
     lines.push("", "=== 已加载的异常任务 ===");
-    for (const account of localQueues.accounts) {
-      for (const task of account.failures) {
-        lines.push(`[${task.recovery}] ${task.url}`);
-        lines.push(`  原因: ${task.message}`);
-        for (const section of task.sections || [])
-          lines.push(`  - 章节 ${section.section}: ${section.message}`);
-      }
+    for (const task of allFailures) {
+      lines.push(`[${task.recovery}] ${sanitizeOfflineUrl(task.url)}`);
+      lines.push(`  原因: ${task.message}`);
+      for (const section of task.sections || [])
+        lines.push(`  - 章节 ${section.section}: ${section.message}`);
     }
   }
   lines.push("", "=== 最近内存日志 ===");
@@ -233,7 +262,9 @@ async function exportDiagnosticLogs() {
   if (exportingLogs) return;
   exportingLogs = true;
   try {
-    const response = await fetch("/api/diagnostics/export");
+    const response = await fetch("/api/diagnostics/export", {
+      signal: AbortSignal.timeout(8000),
+    });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const content = await response.text();
     const match = response.headers
@@ -246,11 +277,15 @@ async function exportDiagnosticLogs() {
   } catch (e) {
     const reason = e instanceof Error ? e.message : String(e);
     const filename = `course-pilot-error-log-offline-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
-    triggerDownload(
-      filename,
-      buildOfflineDiagnosticLog(reason),
-      "text/plain; charset=utf-8",
-    );
+    try {
+      triggerDownload(
+        filename,
+        buildOfflineDiagnosticLog(reason),
+        "text/plain; charset=utf-8",
+      );
+    } catch {
+      error("导出日志失败，请检查浏览器下载权限");
+    }
   } finally {
     exportingLogs = false;
   }
@@ -379,10 +414,13 @@ async function send(path: string, payload: Record<string, unknown>) {
       }
     }
     if (!response) throw new Error("请求未完成");
-    const data = await response.json();
+    const data = (await response.json().catch(() => ({}))) as {
+      error?: string;
+      snapshot?: Snapshot;
+    };
     if (!response.ok)
       throw new Error(data.error || `请求失败 (${response.status})`);
-    render(data.snapshot);
+    if (data.snapshot) render(data.snapshot);
     return true;
   } catch (e) {
     error(
@@ -411,13 +449,14 @@ async function answer(prompt: Prompt, value: unknown) {
 
 // Chromium restores a sheet's scroll offset, but each opening starts at the top.
 function showSheet(dialog: HTMLDialogElement) {
-  dialog.showModal();
-  dialog.querySelector(".sheet-body")!.scrollTop = 0;
+  if (!dialog.open) dialog.showModal();
+  const body = dialog.querySelector(".sheet-body");
+  if (body) body.scrollTop = 0;
 }
 
 function renderPrompt(prompt: Prompt | null) {
   if (!prompt) {
-    promptDialog.close();
+    if (promptDialog.open) promptDialog.close();
     promptDialog.replaceChildren();
     activePrompt = null;
     return;
@@ -446,11 +485,12 @@ function renderPrompt(prompt: Prompt | null) {
   button(prompt.confirmLabel, () => answer(prompt, true), "primary");
   promptDialog.replaceChildren(body, actions);
   if (accountMenu.matches(":popover-open")) accountMenu.hidePopover();
-  promptDialog.showModal();
+  if (!promptDialog.open) promptDialog.showModal();
 }
 promptDialog.addEventListener("cancel", (event) => {
   event.preventDefault();
-  void answer(state!.prompt!, false);
+  if (!state?.prompt || !canControl || pending) return;
+  void answer(state.prompt, false);
 });
 
 function selectedAccounts() {
@@ -596,6 +636,7 @@ function renderLocalAccounts(queues: LocalQueues, selected?: string) {
 }
 async function openLocalDialog(kind: LocalDialogKind) {
   const request = ++localRequest;
+  lastFailedQueueRevision = null;
   try {
     const queues = await loadLocalQueues();
     if (request !== localRequest) return;
@@ -641,12 +682,13 @@ async function openLocalDialog(kind: LocalDialogKind) {
   }
 }
 $("queue-form").onchange = () => {
+  $("queue-error").textContent = "";
   renderLocalIssues();
   updateLocalDialog();
 };
 function closeLocalDialog() {
   localRequest++;
-  queueDialog.close();
+  if (queueDialog.open) queueDialog.close();
 }
 $("queue-close").onclick = closeLocalDialog;
 queueDialog.addEventListener("cancel", (event) => {
@@ -660,12 +702,16 @@ async function refreshLocalDialog() {
   try {
     const queues = await loadLocalQueues();
     if (request !== localRequest || !queueDialog.open) return;
+    lastFailedQueueRevision = null;
+    $("queue-error").textContent = "";
     renderLocalAccounts(queues, queueAccount.value);
     renderLocalIssues();
     updateLocalDialog();
   } catch (e) {
-    if (request === localRequest && queueDialog.open)
+    if (request === localRequest && queueDialog.open) {
+      lastFailedQueueRevision = state?.queues_revision ?? null;
       $("queue-error").textContent = (e as Error).message;
+    }
   } finally {
     if (localRefreshRequest === request) localRefreshRequest = null;
   }
@@ -909,7 +955,11 @@ function render(snapshot: Snapshot) {
   const d = state.dashboard || {};
   renderAccount(d);
   renderHero(state, d);
-  if (queueDialog.open && state.queues_revision !== localQueues.revision)
+  if (
+    queueDialog.open &&
+    state.queues_revision !== localQueues.revision &&
+    state.queues_revision !== lastFailedQueueRevision
+  )
     void refreshLocalDialog();
 
   const aiBadge = $("ai-badge");
@@ -997,12 +1047,34 @@ function render(snapshot: Snapshot) {
 
 function connect() {
   if (replaced) return;
-  socket = new WebSocket(
-    location.origin.replace("http:", "ws:") + "/api/events",
+  clearTimeout(reconnectTimer);
+  reconnectTimer = 0;
+  const prev = socket;
+  if (prev && prev.readyState !== WebSocket.CLOSED) prev.close();
+  const ws = new WebSocket(
+    location.origin.replace(/^http/, "ws") + "/api/events",
   );
-  socket.onopen = () => socket?.send(JSON.stringify({ client }));
-  socket.onmessage = (event) => {
-    const data = JSON.parse(event.data);
+  socket = ws;
+  ws.onopen = () => {
+    if (ws !== socket) return;
+    ws.send(JSON.stringify({ client }));
+  };
+  ws.onmessage = (event) => {
+    if (ws !== socket) return;
+    let data: any;
+    try {
+      data = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (
+      !data ||
+      typeof data !== "object" ||
+      !data.control ||
+      !Array.isArray(data.logs)
+    )
+      return;
+    reconnectDelay = 1500;
     generation = data.generation;
     canControl = !!data.controller;
     live = true;
@@ -1012,13 +1084,16 @@ function connect() {
     );
     render(data);
   };
-  socket.onclose = (event) => {
+  ws.onclose = (event) => {
+    if (ws !== socket) return;
+    socket = null;
     canControl = false;
     live = false;
     generation = null;
     replaced = event.code === 4001;
+    const exitingDone = !!state?.control.exit_requested && !state?.operation_id;
     setConnection(
-      state?.control.exit_requested
+      exitingDone
         ? "程序已退出"
         : replaced
           ? "控制已转到重连窗口"
@@ -1027,9 +1102,27 @@ function connect() {
     );
     if (state) renderHero(state, state.dashboard || {});
     availability();
-    if (!replaced && !state?.control.exit_requested) setTimeout(connect, 1500);
+    if (!replaced && !exitingDone) {
+      const delay = reconnectDelay;
+      reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+      reconnectTimer = window.setTimeout(async () => {
+        reconnectTimer = 0;
+        try {
+          const probe = await fetch("/api/state", {
+            signal: AbortSignal.timeout(4000),
+          });
+          if (probe.status === 401) {
+            setConnection("会话已失效，请重新启动入口", "offline");
+            return;
+          }
+        } catch {}
+        connect();
+      }, delay);
+    }
   };
-  socket.onerror = () => socket?.close();
+  ws.onerror = () => {
+    if (ws === socket) ws.close();
+  };
 }
 
 async function start() {
@@ -1068,7 +1161,6 @@ async function start() {
         },
       );
     } else {
-      client = "";
       connect();
     }
   } catch (e) {
@@ -1136,6 +1228,10 @@ $("queue-import").onchange = async () => {
   const file = input.files?.[0];
   if (!file) return;
   try {
+    if (!canControl || pending)
+      throw new Error("当前窗口只读或有操作正在执行，无法导入");
+    if (file.size > 10 * 1024 * 1024)
+      throw new Error("导入文件超过 10 MiB 限制");
     const bundle = JSON.parse(await file.text());
     await send("/api/import", { bundle });
   } catch (e) {
@@ -1350,10 +1446,14 @@ modelsFetch.onclick = async () => {
       }),
       signal: request.signal,
     });
-    const data = await response.json();
+    const data = (await response.json().catch(() => ({}))) as {
+      error?: string;
+      models?: string[];
+    };
     if (request.signal.aborted) return;
-    if (!response.ok) throw new Error(data.error);
-    models = data.models;
+    if (!response.ok)
+      throw new Error(data.error || `获取模型失败 (${response.status})`);
+    models = Array.isArray(data.models) ? data.models : [];
     modelsLoaded = true;
     modelStatus(
       models.length
@@ -1376,10 +1476,12 @@ modelsFetch.onclick = async () => {
   }
 };
 $("settings-open").onclick = async () => {
+  const request = ++settingsRequest;
   try {
     const response = await fetch("/api/settings");
     if (!response.ok) throw new Error("无法读取设置");
     const settings = await response.json();
+    if (request !== settingsRequest) return;
     savedModelBaseURL = settings.openai.baseURL;
     savedModelKey = settings.openai.keyConfigured;
     for (const field of settingsFields) {
@@ -1392,11 +1494,15 @@ $("settings-open").onclick = async () => {
     $("settings-error").textContent = "";
     showSheet(settingsDialog);
   } catch (e) {
-    error(e instanceof Error ? e.message : "无法读取设置");
+    if (request === settingsRequest)
+      error(e instanceof Error ? e.message : "无法读取设置");
   }
 };
-$("settings-close").onclick = () => settingsDialog.close();
+$("settings-close").onclick = () => {
+  if (settingsDialog.open) settingsDialog.close();
+};
 settingsDialog.addEventListener("close", () => {
+  settingsRequest++;
   resetModels();
   settingsApiKey.value = "";
 });

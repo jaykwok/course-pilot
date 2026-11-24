@@ -43,19 +43,30 @@ async function main() {
       else throw new Error("管理窗口已关闭，服务正在退出");
     };
     await lock.publish(server.origin, server.reopenKey);
-    const management = await browser.openManagement(url);
-    // A closed management page is the lifecycle boundary; business popups never own shutdown.
-    const off = management.onClose.on(() => app!.exit());
-    const signal = () => app!.exit();
-    process.on("SIGINT", signal);
-    process.on("SIGTERM", signal);
+    const exiting = new Promise<void>((resolve) => {
+      if (app!.exited) resolve();
+      else app!.once("exit", resolve);
+    });
+    let sigints = 0;
+    const onSigint = () => {
+      sigints++;
+      app!.exit(sigints > 1);
+    };
+    const onSigterm = () => app!.exit(true);
+    process.on("SIGINT", onSigint);
+    process.on("SIGTERM", onSigterm);
+    let off = () => {};
     try {
-      await new Promise<void>((resolve) => app!.once("exit", resolve));
+      const management = await browser.openManagement(url);
+      // A closed management page is the lifecycle boundary; business popups never own shutdown.
+      off = management.onClose.on(() => app!.exit(true));
+      if (management.closed || browser.browser.closed) app!.exit(true);
+      await exiting;
       await app.settled();
     } finally {
       off();
-      process.off("SIGINT", signal);
-      process.off("SIGTERM", signal);
+      process.off("SIGINT", onSigint);
+      process.off("SIGTERM", onSigterm);
     }
   } finally {
     try {
@@ -64,8 +75,11 @@ async function main() {
       try {
         await browser?.close();
       } finally {
-        repo?.close();
-        await lock.close();
+        try {
+          repo?.close();
+        } finally {
+          await lock.close();
+        }
       }
     }
   }

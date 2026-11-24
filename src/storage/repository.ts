@@ -1,8 +1,9 @@
 import { DatabaseSync, backup } from "node:sqlite";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { entry, type Entry } from "../domain/identity.ts";
 import { token } from "../utils.ts";
+import { renameWithRetry } from "./files.ts";
 
 export type Queue = "learn" | "exam" | "review" | "failure" | "discover";
 export type Status =
@@ -46,43 +47,72 @@ export class Repository {
     this.directory = directory;
     mkdirSync(directory, { recursive: true });
     const file = join(directory, "workbench.sqlite");
-    const existing = existsSync(file);
+    const walFile = `${file}-wal`;
+    const fileSize = existsSync(file) ? statSync(file).size : 0;
+    const walSize = existsSync(walFile) ? statSync(walFile).size : 0;
+    const existing = fileSize > 0 || walSize > 0;
+    const checkHeader = (db: DatabaseSync) => {
+      if (
+        Number(db.prepare("PRAGMA application_id").get()?.application_id) !==
+          APPLICATION_ID ||
+        Number(db.prepare("PRAGMA user_version").get()?.user_version) !== SCHEMA
+      )
+        throw new Error("工作台数据库版本不匹配");
+    };
     // Inspect an existing database read-only before enabling WAL or making any writes.
+    // If an unclean shutdown left a WAL without a valid -shm index, recover via RW open
+    // and verify header pragmas immediately before making any schema/data writes.
+    let needsHeaderCheck = false;
     if (existing) {
-      const probe = new DatabaseSync(file, { readOnly: true });
+      let probe: DatabaseSync | undefined;
       try {
-        if (
-          Number(
-            probe.prepare("PRAGMA application_id").get()?.application_id,
-          ) !== APPLICATION_ID ||
-          Number(probe.prepare("PRAGMA user_version").get()?.user_version) !==
-            SCHEMA
-        )
-          throw new Error("工作台数据库版本不匹配");
+        probe = new DatabaseSync(file, { readOnly: true });
+        checkHeader(probe);
+      } catch (error) {
+        const errcode = (error as { errcode?: number }).errcode;
+        if (walSize > 0 && (errcode === 776 || errcode === 1288))
+          needsHeaderCheck = true;
+        else throw error;
       } finally {
-        probe.close();
+        probe?.close();
       }
     }
     this.db = new DatabaseSync(file);
-    this.db.exec(
-      "PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;",
-    );
-    if (!existing)
+    try {
+      this.db.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
+      if (needsHeaderCheck) checkHeader(this.db);
+      if (!existing) {
+        // Write schema and header pragmas before WAL so page 1 is durable immediately.
+        this.transaction(() => {
+          this.db.exec(sql);
+          this.db.exec(
+            `PRAGMA application_id=${APPLICATION_ID}; PRAGMA user_version=${SCHEMA}`,
+          );
+        });
+      }
+      this.db.exec("PRAGMA journal_mode=WAL;");
       this.transaction(() => {
-        this.db.exec(sql);
         this.db.exec(
-          `PRAGMA application_id=${APPLICATION_ID}; PRAGMA user_version=${SCHEMA}`,
+          "UPDATE runs SET status='INTERRUPTED' WHERE status='RUNNING'; UPDATE tasks SET status='INTERRUPTED' WHERE status='RUNNING';",
+        );
+        // A crash cannot convert an uncertain submission into a fresh attempt,
+        // nor revert an exam already verified as COMPLETED.
+        this.db.exec(
+          "UPDATE tasks SET manual_submit=1,status='NEEDS_REVIEW' WHERE status!='COMPLETED' AND id IN (SELECT task_id FROM intents WHERE operation='submit' AND state='PENDING')",
+        );
+        this.db.exec(
+          "INSERT OR IGNORE INTO queues(task_id,queue,reason,position) SELECT id,'review','submission_unverified',0 FROM tasks WHERE status!='COMPLETED' AND kind='exam' AND id IN (SELECT task_id FROM intents WHERE operation='submit' AND state='PENDING')",
+        );
+        this.db.exec(
+          "DELETE FROM queues WHERE queue='exam' AND task_id IN (SELECT id FROM tasks WHERE status!='COMPLETED' AND kind='exam' AND id IN (SELECT task_id FROM intents WHERE operation='submit' AND state='PENDING'))",
         );
       });
-    this.transaction(() => {
-      this.db.exec(
-        "UPDATE runs SET status='INTERRUPTED' WHERE status='RUNNING'; UPDATE tasks SET status='INTERRUPTED' WHERE status='RUNNING';",
-      );
-      // A crash cannot convert an uncertain submission into a fresh attempt.
-      this.db.exec(
-        "UPDATE tasks SET manual_submit=1,status='NEEDS_REVIEW' WHERE id IN (SELECT task_id FROM intents WHERE operation='submit' AND state='PENDING')",
-      );
-    });
+    } catch (error) {
+      try {
+        this.db.close();
+      } catch {}
+      throw error;
+    }
   }
   transaction<T>(fn: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
@@ -91,7 +121,11 @@ export class Repository {
       this.db.exec("COMMIT");
       return result;
     } catch (e) {
-      this.db.exec("ROLLBACK");
+      if (this.db.isTransaction) {
+        try {
+          this.db.exec("ROLLBACK");
+        } catch {}
+      }
       throw e;
     }
   }
@@ -116,10 +150,16 @@ export class Repository {
   task(id: string): Task {
     const row = this.db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
     if (!row) throw new Error("任务不存在");
+    let details: Record<string, any> = {};
+    try {
+      const parsed = JSON.parse(String(row.details));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+        details = parsed;
+    } catch {}
     return {
       ...JSON.parse(String(row.identity)),
       status: row.status as Status,
-      details: JSON.parse(String(row.details)),
+      details,
       manualSubmit: !!row.manual_submit,
     };
   }
@@ -260,6 +300,11 @@ export class Repository {
   complete(task: Task, evidence: Record<string, unknown>) {
     this.transaction(() => {
       this.outcome(task.id, "COMPLETED", { evidence });
+      this.db
+        .prepare(
+          "UPDATE intents SET state='VERIFIED',receipt=? WHERE task_id=? AND operation='submit' AND state='PENDING'",
+        )
+        .run(JSON.stringify(evidence), task.id);
       this.db.prepare("DELETE FROM queues WHERE task_id=?").run(task.id);
     });
     this.refreshParents(task.id);
@@ -322,12 +367,15 @@ export class Repository {
       )
       .get(id);
     if (undiscovered) return;
+    const failed = this.hasFailure(id);
     if (task.details.residual) {
-      this.outcome(id, "WAITING_SYNC", {
-        discoveryComplete: true,
-        reason: undefined,
-        message: undefined,
-      });
+      if (failed) this.outcome(id, task.status, { discoveryComplete: true });
+      else
+        this.outcome(id, "WAITING_SYNC", {
+          discoveryComplete: true,
+          reason: undefined,
+          message: undefined,
+        });
       return;
     }
     const unfinished = this.db
@@ -336,6 +384,10 @@ export class Repository {
       )
       .get(id);
     this.transaction(() => {
+      if (unfinished && failed) {
+        this.outcome(id, task.status, { discoveryComplete: true });
+        return;
+      }
       this.outcome(id, unfinished ? "WAITING_CHILDREN" : "COMPLETED", {
         discoveryComplete: true,
         reason: undefined,
@@ -424,20 +476,33 @@ export class Repository {
       dir,
       `${Date.now()}-${label}-${token().slice(0, 8)}.sqlite`,
     );
-    await backup(this.db, path);
-    return path;
+    const tmp = `${path}.tmp`;
+    try {
+      await backup(this.db, tmp);
+      await renameWithRetry(tmp, path);
+      return path;
+    } catch (error) {
+      try {
+        rmSync(tmp, { force: true });
+      } catch {}
+      throw error;
+    }
   }
   async clear(
     account: string | null,
     scope: "failures" | "courses" | "exams" | "all",
+    signal?: AbortSignal,
   ) {
-    await this.snapshot("queues");
     const queues = {
       failures: ["failure"],
       courses: ["learn", "failure", "discover"],
       exams: ["exam", "review"],
       all: ["learn", "failure", "discover", "exam", "review"],
     }[scope];
+    if (!queues) throw new Error("清空范围无效");
+    signal?.throwIfAborted();
+    await this.snapshot("queues");
+    signal?.throwIfAborted();
     const result = this.db
       .prepare(
         `DELETE FROM queues WHERE task_id IN (SELECT id FROM tasks WHERE ? IS NULL OR account=?) AND queue IN (${queues.map(() => "?").join(",")})`,

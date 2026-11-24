@@ -1,4 +1,5 @@
 import {
+  ActionabilityError,
   InputActionError,
   isContextGone,
   SessionEndedError,
@@ -17,55 +18,66 @@ export async function waitForCasePoolSession(
   timeout = 60000,
 ) {
   const deadline = Date.now() + timeout;
+  const remaining = (cap: number) =>
+    Math.max(1, Math.min(cap, deadline - Date.now()));
   let clicked = false;
+  const isTransient = (error: unknown) =>
+    error instanceof TimeoutError ||
+    error instanceof StaleElementError ||
+    error instanceof ActionabilityError ||
+    isContextGone(error) ||
+    (error instanceof SessionEndedError && !tab.closed);
   while (Date.now() < deadline) {
     guard();
     signal.throwIfAborted();
     if (tab.closed) throw new Error("案例库页面已关闭");
     try {
-      try {
-        await tab.waitForFunction(
-          (target) => {
-            const expected = new URL(target);
-            return (
-              location.origin === expected.origin &&
-              location.pathname.replace(/\/$/, "") === expected.pathname &&
-              document.readyState !== "loading" &&
-              !!localStorage.getItem("userID")
-            );
-          },
-          CASE_POOL,
-          {
-            timeout: Math.max(1, Math.min(500, deadline - Date.now())),
-            signal,
-          },
-        );
-        guard();
-        return;
-      } catch (error) {
-        if (!(error instanceof TimeoutError)) throw error;
-      }
+      await tab.waitForFunction(
+        (target) => {
+          const expected = new URL(target);
+          return (
+            location.origin === expected.origin &&
+            location.pathname.replace(/\/$/, "") === expected.pathname &&
+            document.readyState !== "loading" &&
+            !!localStorage.getItem("userID")
+          );
+        },
+        CASE_POOL,
+        {
+          timeout: remaining(500),
+          signal,
+          world: "isolated",
+        },
+      );
+      guard();
+      return;
+    } catch (error) {
       signal.throwIfAborted();
-      if (Date.now() >= deadline) break;
-      if (!clicked) {
-        for (const frame of tab.frames) {
-          if (frame.detached) continue;
-          let host: string;
-          try {
-            host = new URL(frame.url).hostname;
-          } catch {
-            continue;
-          }
-          if (
-            !["ctexpert.cn", "www.ctexpert.cn"].includes(host) &&
-            !platformHost(host)
-          )
-            continue;
+      if (!isTransient(error)) throw error;
+    }
+    signal.throwIfAborted();
+    if (Date.now() >= deadline) break;
+    if (!clicked) {
+      for (const frame of tab.frames) {
+        if (Date.now() >= deadline) break;
+        if (frame.detached) continue;
+        let host: string;
+        try {
+          host = new URL(frame.url).hostname;
+        } catch {
+          continue;
+        }
+        if (
+          !["ctexpert.cn", "www.ctexpert.cn"].includes(host) &&
+          !platformHost(host)
+        )
+          continue;
+        try {
           // A password form needs human input; only follow an explicit SSO entry.
           if (
             await frame.query('input[type="password"]', {
               visible: true,
-              timeout: 1000,
+              timeout: remaining(1000),
               signal,
             })
           )
@@ -74,10 +86,11 @@ export async function waitForCasePoolSession(
             'button,a,[role="button"],input[type="button"],input[type="submit"]',
             {
               visible: true,
-              timeout: 1000,
+              timeout: remaining(1000),
               signal,
             },
           )) {
+            if (Date.now() >= deadline) break;
             const eligible = await button.evaluate(
               (e) =>
                 [
@@ -101,31 +114,28 @@ export async function waitForCasePoolSession(
                 !e.matches(":disabled") &&
                 e.getAttribute("aria-disabled") !== "true",
               undefined,
-              { timeout: 1000, signal },
+              { timeout: remaining(1000), signal },
             );
             if (!eligible) continue;
-            await button.click({ timeout: 3000, signal, guard });
+            await button.click({ timeout: remaining(3000), signal, guard });
             clicked = true;
             break;
           }
           if (clicked) break;
+        } catch (error) {
+          if (error instanceof InputActionError) {
+            const cleanup = await error.cleanup;
+            if (error.report.dispatched > 0 || cleanup.report.dispatched > 0)
+              clicked = true;
+            signal.throwIfAborted();
+            if (cleanup.status !== "completed") throw error;
+            error = error.cause;
+          }
+          signal.throwIfAborted();
+          if (frame.detached || isTransient(error)) continue;
+          throw error;
         }
       }
-    } catch (error) {
-      signal.throwIfAborted();
-      if (error instanceof InputActionError) {
-        if (error.report.dispatched > 0) clicked = true;
-        if ((await error.cleanup).status !== "completed") throw error;
-        error = error.cause;
-      }
-      if (
-        error instanceof TimeoutError ||
-        error instanceof StaleElementError ||
-        isContextGone(error) ||
-        (error instanceof SessionEndedError && !tab.closed)
-      )
-        continue;
-      throw error;
     }
   }
   throw new ReviewRequired(

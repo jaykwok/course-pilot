@@ -6,17 +6,27 @@ import {
   renameSync,
 } from "node:fs";
 import { join } from "node:path";
+const MAX_LOG_BYTES = 10 * 1024 * 1024;
 export function redact(input: unknown): string {
+  if (input == null) return "";
   return String(input instanceof Error ? input.message : input)
+    .replace(/(https?:\/\/)([^/\s@]+)@/gi, "$1[已隐藏]@")
     .replace(
-      /([?&#](?:token|code|ticket|authorization|bootstrap|key|access_token)=)[^&#\s]*/gi,
+      /([?&#](?:token|code|ticket|authorization|bootstrap|key|api[_-]?key|access[_-]?token|secret|password|sig|signature)=)[^&#\s]*/gi,
       "$1[已隐藏]",
     )
     .replace(
-      /((?:authorization|cookie|x-token|api[_-]?key|access[_-]?token|token|ticket|bootstrap|password)\s*[:=]\s*)[^\r\n,;]+/gi,
-      "$1[已隐藏]",
+      /((?:"|')?(?:authorization|cookie|course_web|x-token|x-control-client|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|token|ticket|bootstrap|password|secret)(?:"|')?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|\[已隐藏\]|[^\r\n,;}\]&]+)/gi,
+      (_, prefix: string) =>
+        prefix.trimEnd().endsWith(":") &&
+        (prefix.startsWith('"') || prefix.startsWith("'"))
+          ? `${prefix}"[已隐藏]"`
+          : `${prefix}[已隐藏]`,
     )
-    .replace(/\bBearer(?:__|\s+)[\w.\-]+/gi, "Bearer [已隐藏]")
+    .replace(
+      /\b(?:Bearer(?:__|\s+|%5F%5F|%20)|Basic(?:\s+|%20))[^\s"'&,;]+/gi,
+      (match) => (/^basic/i.test(match) ? "Basic [已隐藏]" : "Bearer [已隐藏]"),
+    )
     .replace(/\bsk-[\w-]+/g, "[已隐藏]")
     .slice(0, 12000);
 }
@@ -84,22 +94,31 @@ export class Logger {
       }`,
       path = join(this.directory, `app-${level}.log`);
     const today = new Date().toISOString().slice(0, 10);
-    if (existsSync(path)) {
-      const day = statSync(path).mtime.toISOString().slice(0, 10);
-      if (day !== today)
-        renameSync(
-          path,
-          join(this.directory, `app-${level}-${day}-${Date.now()}.log`),
-        );
+    const line = `${new Date().toISOString()} [${level}] ${diskText}\n`;
+    try {
+      if (existsSync(path)) {
+        try {
+          const stats = statSync(path);
+          const day = stats.mtime.toISOString().slice(0, 10);
+          if (day !== today || stats.size >= MAX_LOG_BYTES)
+            renameSync(
+              path,
+              join(this.directory, `app-${level}-${day}-${Date.now()}.log`),
+            );
+        } catch {}
+      }
+      try {
+        appendFileSync(path, line, { encoding: "utf8", mode: 0o600 });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          mkdirSync(this.directory, { recursive: true });
+          appendFileSync(path, line, { encoding: "utf8", mode: 0o600 });
+        } else throw error;
+      }
+    } catch (error) {
+      if (process.env.COURSE_AFK_QUIET !== "1")
+        console.error("写入日志文件失败:", redact(error));
     }
-    appendFileSync(
-      path,
-      `${new Date().toISOString()} [${level}] ${diskText}\n`,
-      {
-        encoding: "utf8",
-        mode: 0o600,
-      },
-    );
     this.listener?.(text, level);
     if (process.env.COURSE_AFK_QUIET !== "1") console.log(text);
   }

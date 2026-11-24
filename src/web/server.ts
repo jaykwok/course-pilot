@@ -4,18 +4,26 @@ import {
   type ServerResponse,
 } from "node:http";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { token } from "../utils.ts";
 import { Application, ProtocolError } from "../application/runtime.ts";
-import { publicSettings, readSettings, validateSettings } from "../config.ts";
+import {
+  defaults,
+  publicSettings,
+  readSettings,
+  validateSettings,
+} from "../config.ts";
 import { listModels } from "../ai/models.ts";
 
+const MAX_IMPORT_BYTES = 10 * 1024 * 1024;
 const equal = (a: unknown, b: string) =>
   typeof a === "string" &&
   Buffer.byteLength(a) === Buffer.byteLength(b) &&
   timingSafeEqual(Buffer.from(a), Buffer.from(b));
+const safeFilename = (name: string) =>
+  basename(name).replace(/[^a-zA-Z0-9._-]/g, "_") || "download.txt";
 export class WebServer {
   readonly app: Application;
   readonly server;
@@ -33,12 +41,16 @@ export class WebServer {
   private writer?: WebSocket;
   private generation = "";
   private timer?: NodeJS.Timeout;
+  private delivered = new WeakMap<
+    WebSocket,
+    { base: string; controller: boolean; generation: string | null }
+  >();
   reopen?: () => Promise<void>;
   constructor(app: Application) {
     this.app = app;
     this.server = createServer((req, res) => {
       void this.handle(req, res).catch((e) => {
-        app.logger.log(e, "error");
+        this.safeLog(e);
         if (!res.headersSent) this.json(res, 500, { error: "服务请求失败" });
         else res.end();
       });
@@ -46,37 +58,76 @@ export class WebServer {
     this.server.requestTimeout = 15000;
     this.server.headersTimeout = 10000;
     this.server.on("upgrade", (req, socket, head) => {
+      socket.on("error", () => {});
       try {
         this.boundary(req);
-        if (
-          req.url !== "/api/events" ||
-          req.headers.origin !== this.origin ||
-          this.sockets.clients.size >= 8
-        )
+        const path = this.pathname(req);
+        if (path !== "/api/events" || req.headers.origin !== this.origin)
           throw new ProtocolError("连接不可用", 403);
+        const excess = this.sockets.clients.size - 7;
+        if (excess > 0) {
+          const observers = [...this.sockets.clients].filter(
+            (ws) => ws !== this.writer,
+          );
+          if (observers.length < excess)
+            throw new ProtocolError("连接不可用", 403);
+          for (const ws of observers.slice(0, excess)) ws.terminate();
+        }
         this.sockets.handleUpgrade(req, socket, head, (ws) => this.events(ws));
       } catch {
         socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
       }
     });
   }
+  private safeLog(e: unknown) {
+    try {
+      this.app.logger.log(e, "error");
+    } catch (logError) {
+      console.error(logError);
+    }
+  }
+  private pathname(req: IncomingMessage) {
+    try {
+      return new URL(req.url || "/", this.origin || "http://127.0.0.1")
+        .pathname;
+    } catch {
+      throw new ProtocolError("请求路径无效", 400);
+    }
+  }
   async start(port = 9999) {
     await new Promise<void>((resolve, reject) => {
-      this.server.once("error", reject);
-      this.server.listen(port, "127.0.0.1", () => resolve());
+      const onError = (err: Error) => reject(err);
+      this.server.once("error", onError);
+      this.server.listen(port, "127.0.0.1", () => {
+        this.server.off("error", onError);
+        resolve();
+      });
     });
     const address = this.server.address();
     if (!address || typeof address === "string")
       throw new Error("服务监听失败");
     this.origin = `http://127.0.0.1:${address.port}`;
     this.timer = setInterval(() => {
-      for (const ws of this.sockets.clients) {
-        if (ws.readyState !== WebSocket.OPEN) continue;
-        if (ws.bufferedAmount > 256 * 1024) {
-          ws.terminate();
-          continue;
+      try {
+        let cached:
+          | { snapshot: ReturnType<Application["snapshot"]>; base: string }
+          | undefined;
+        for (const ws of this.sockets.clients) {
+          if (ws.readyState !== WebSocket.OPEN) continue;
+          if (ws.bufferedAmount > 256 * 1024) {
+            ws.terminate();
+            continue;
+          }
+          if (!(ws as WebSocket & { ready?: () => boolean }).ready?.())
+            continue;
+          if (!cached) {
+            const snapshot = this.app.snapshot();
+            cached = { snapshot, base: JSON.stringify(snapshot) };
+          }
+          this.send(ws, cached);
         }
-        this.send(ws);
+      } catch (e) {
+        this.safeLog(e);
       }
     }, 500);
     this.timer.unref();
@@ -87,10 +138,12 @@ export class WebServer {
       throw new ProtocolError("Host rejected", 403);
     if (req.headers.origin !== undefined && req.headers.origin !== this.origin)
       throw new ProtocolError("Origin rejected", 403);
-    const path = req.url || "/";
+    const path = this.pathname(req);
     if (
       req.method === "POST" &&
-      (!req.headers["content-type"]?.startsWith("application/json") ||
+      (!/^application\/json(?:\s*;|$)/i.test(
+        req.headers["content-type"] || "",
+      ) ||
         (path !== "/api/reopen" && req.headers.origin !== this.origin))
     )
       throw new ProtocolError("请求来源或格式不正确", 403);
@@ -98,13 +151,13 @@ export class WebServer {
       path.startsWith("/api/") &&
       !["/api/session", "/api/reopen"].includes(path)
     ) {
-      const c = (req.headers.cookie || "")
+      const validCookie = (req.headers.cookie || "")
         .split(";")
         .map((v) => v.trim())
-        .find((v) => v.startsWith("course_web="))
-        ?.slice(11);
-      if (!equal(c, this.cookie))
-        throw new ProtocolError("请从启动入口打开工作台", 401);
+        .some(
+          (v) => v.startsWith("course_web=") && equal(v.slice(11), this.cookie),
+        );
+      if (!validCookie) throw new ProtocolError("请从启动入口打开工作台", 401);
       if (
         req.method === "POST" &&
         !equal(req.headers["x-csrf-token"], this.csrf)
@@ -126,9 +179,10 @@ export class WebServer {
     const chunks: Buffer[] = [];
     let size = 0;
     for await (const chunk of req) {
-      size += chunk.length;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buf.length;
       if (size > limit) throw new ProtocolError("请求内容过长", 413);
-      chunks.push(Buffer.from(chunk));
+      chunks.push(buf);
     }
     let value;
     try {
@@ -160,7 +214,7 @@ export class WebServer {
   private async handle(req: IncomingMessage, res: ServerResponse) {
     try {
       this.boundary(req);
-      const path = req.url || "/";
+      const path = this.pathname(req);
       if (
         req.method === "GET" &&
         [
@@ -208,7 +262,7 @@ export class WebServer {
         this.headers(res);
         res.writeHead(200, {
           "Content-Type": "text/plain; charset=utf-8",
-          "Content-Disposition": `attachment; filename="${report.filename}"`,
+          "Content-Disposition": `attachment; filename="${safeFilename(report.filename)}"`,
         });
         res.end(report.content);
         return;
@@ -217,11 +271,18 @@ export class WebServer {
       if (req.method === "GET" && exportId) {
         const file = this.app.exports.get(exportId);
         if (!file) throw new ProtocolError("导出链接已失效，请重新导出", 404);
-        const body = await readFile(file.path);
+        let body: Buffer;
+        try {
+          body = await readFile(file.path);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "ENOENT")
+            throw new ProtocolError("导出文件已不存在，请重新导出", 404);
+          throw err;
+        }
         this.headers(res);
         res.writeHead(200, {
           "Content-Type": "application/json; charset=utf-8",
-          "Content-Disposition": `attachment; filename="${file.filename}"`,
+          "Content-Disposition": `attachment; filename="${safeFilename(file.filename)}"`,
         });
         res.end(body);
         return;
@@ -250,11 +311,16 @@ export class WebServer {
       this.writerCheck(req);
       const p = await this.payload(
         req,
-        path === "/api/import" ? Infinity : 65536,
+        path === "/api/import" ? MAX_IMPORT_BYTES : 65536,
       );
       this.writerCheck(req);
       if (path === "/api/models") {
-        const saved = readSettings(this.app.config.settingsPath);
+        let saved;
+        try {
+          saved = readSettings(this.app.config.settingsPath);
+        } catch {
+          saved = defaults();
+        }
         let settings;
         try {
           settings = validateSettings({
@@ -296,7 +362,9 @@ export class WebServer {
       else if (path === "/api/import") {
         action = "operation";
         p.kind = "import_queues";
-      } else if (/^\/api\/control\/[\w-]+$/.test(path))
+      } else if (
+        /^\/api\/control\/(cancel|stop-after-current|exit)$/.test(path)
+      )
         action = path.split("/").at(-1)!;
       else {
         const match = path.match(/^\/api\/prompts\/([\w-]+)\/answer$/);
@@ -311,11 +379,13 @@ export class WebServer {
       const result = this.app.command(id, action, p);
       this.json(res, 200, { result, snapshot: this.app.snapshot() });
     } catch (e) {
-      this.json(res, e instanceof ProtocolError ? e.status : 500, {
-        error:
-          e instanceof ProtocolError ? e.message : "请求执行失败，请查看日志",
-      });
-      if (!(e instanceof ProtocolError)) this.app.logger.log(e, "error");
+      if (!res.headersSent)
+        this.json(res, e instanceof ProtocolError ? e.status : 500, {
+          error:
+            e instanceof ProtocolError ? e.message : "请求执行失败，请查看日志",
+        });
+      else res.end();
+      if (!(e instanceof ProtocolError)) this.safeLog(e);
     }
   }
   private events(ws: WebSocket) {
@@ -345,6 +415,7 @@ export class WebServer {
     ws.on("error", () => {});
     ws.on("close", () => {
       clearTimeout(timeout);
+      this.delivered.delete(ws);
       if (this.writer === ws) {
         this.writer = undefined;
         this.generation = "";
@@ -353,20 +424,42 @@ export class WebServer {
     });
     (ws as WebSocket & { ready?: () => boolean }).ready = () => ready;
   }
-  private send(ws: WebSocket) {
+  private send(
+    ws: WebSocket,
+    cached?: { snapshot: ReturnType<Application["snapshot"]>; base: string },
+  ) {
     if (!(ws as WebSocket & { ready?: () => boolean }).ready?.()) return;
-    ws.send(
-      JSON.stringify({
-        ...this.app.snapshot(),
-        controller: ws === this.writer,
-        generation: ws === this.writer ? this.generation : null,
-      }),
-    );
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const controller = ws === this.writer;
+    const generation = controller ? this.generation : null;
+    const snapshot = cached?.snapshot ?? this.app.snapshot();
+    const base = cached?.base ?? JSON.stringify(snapshot);
+    const prev = this.delivered.get(ws);
+    if (
+      prev &&
+      prev.base === base &&
+      prev.controller === controller &&
+      prev.generation === generation
+    )
+      return;
+    try {
+      ws.send(
+        JSON.stringify({
+          ...snapshot,
+          controller,
+          generation,
+        }),
+      );
+      this.delivered.set(ws, { base, controller, generation });
+    } catch {
+      ws.terminate();
+    }
   }
   async close() {
     if (this.timer) clearInterval(this.timer);
     for (const ws of this.sockets.clients) ws.terminate();
     this.sockets.close();
+    if (!this.server.listening) return;
     await new Promise<void>((resolve, reject) => {
       this.server.close((e) => (e ? reject(e) : resolve()));
       // Closing the service also cancels in-flight model discovery via res.close.

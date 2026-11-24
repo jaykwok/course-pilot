@@ -1,6 +1,17 @@
-import type { Tab } from "nodriver-ts";
+import {
+  DisconnectedError,
+  InputActionError,
+  InputBlockedError,
+  type Tab,
+} from "nodriver-ts";
 import { PLATFORM } from "../config.ts";
-import { data, ReviewRequired, sleep, until } from "../utils.ts";
+import {
+  AuthenticationError,
+  data,
+  ReviewRequired,
+  sleep,
+  until,
+} from "../utils.ts";
 import { PlatformHttp } from "../browser/http.ts";
 import type { Task } from "../storage/repository.ts";
 import type { DiscoveryContext } from "./discovery.ts";
@@ -62,7 +73,7 @@ export function entryProblem(raw: unknown, id: string): string | undefined {
     state = examState(d),
     now = number(record?.currentTime) ?? Date.now();
   if (
-    d.id !== id ||
+    String(d.id || "").toLowerCase() !== id.toLowerCase() ||
     !record ||
     typeof record !== "object" ||
     !d.paperClass ||
@@ -185,16 +196,22 @@ export async function extractQuestions(
           ).trim();
           const label =
             type === "judge"
-              ? /正确|对|√|true/i.test(content)
-                ? "T"
-                : /错误|错|×|false/i.test(content)
-                  ? "F"
+              ? /不正确|不对|错误|错|×|false/i.test(content)
+                ? "F"
+                : /正确|对|√|true/i.test(content)
+                  ? "T"
                   : ""
               : raw.match(/^([A-Z])(?:[.、．:：)]|$)/)?.[1] ||
                 String.fromCharCode(65 + i);
           return {
             label,
-            text: content.replace(new RegExp(`^${label}[.、．:：)]?\\s*`), ""),
+            text:
+              type === "judge"
+                ? content
+                : content.replace(
+                    new RegExp(`^${label}(?:[.、．:：)]\\s*|\\s+)`),
+                    "",
+                  ),
           };
         });
         const media = !!root.querySelector(
@@ -234,8 +251,13 @@ export async function selectedAnswers(
       if (options.length !== q.options.length) return null;
       const result: string[] = [];
       options.forEach((e, index) => {
+        const candidate = e.closest(
+          ".preview-list dd,.option-item,.answer-item",
+        );
         const parent =
-          e.closest(".preview-list dd,.option-item,.answer-item") || e;
+          candidate && candidate.querySelectorAll(q.optionSelector).length === 1
+            ? candidate
+            : e;
         const input = parent.querySelector<HTMLInputElement>(
           "input[type=checkbox],input[type=radio]",
         );
@@ -400,7 +422,9 @@ export async function runExam(
     if (before.pending)
       throw new ReviewRequired("pending_grading", "试卷已提交，等待评卷");
     const retained = [...ctx.scope.runtime.retained].find(
-      (t) => !t.closed && t.url.includes(task.businessId),
+      (t) =>
+        !t.closed &&
+        t.url.toLowerCase().includes(task.businessId.toLowerCase()),
     );
     if (retained) {
       await retained.bringToFront();
@@ -461,8 +485,10 @@ export async function runExam(
     await tab.bringToFront();
     await until(
       async () => {
+        await inspectAccess(tab, ctx.lease.signal);
         const r = await extractQuestions(tab, ctx.lease.signal);
-        return r.questions.length && r.questions.every((q) => q.text && q.id)
+        return r.questions.length &&
+          r.questions.every((q) => q.id && (q.text || q.media))
           ? r
           : false;
       },
@@ -479,6 +505,7 @@ export async function runExam(
       !snapshot.single;
     const expected = new Map<string, { q: Question; answers: string[] }>(),
       seen = new Set<string>();
+    let consecutiveAiFailures = 0;
     for (let round = 0; round < 500; round++) {
       if (
         !snapshot.questions.length ||
@@ -504,32 +531,66 @@ export async function runExam(
         let answers: string[] = [];
         try {
           answers = await ai.answer(q, ctx.lease.signal);
+          consecutiveAiFailures = 0;
         } catch (e) {
           if (ctx.lease.signal.aborted) throw e;
+          ctx.logError?.(e, `第 ${seen.size} 题 AI 作答异常`);
           permitted = false;
+          consecutiveAiFailures++;
           ctx.report("AI 未返回可执行答案，该题保留人工核对");
+          if (consecutiveAiFailures >= 3) {
+            ctx.report("AI 连续多次请求失败，剩余题目保留在试卷页供人工核对");
+            break;
+          }
+          continue;
         }
-        if (!(await applyAnswers(tab, q, answers, ctx))) {
+        try {
+          if (!(await applyAnswers(tab, q, answers, ctx))) {
+            permitted = false;
+            continue;
+          }
+        } catch (e) {
+          if (e instanceof InputActionError) await e.cleanup;
+          if (
+            ctx.lease.signal.aborted ||
+            e instanceof AuthenticationError ||
+            e instanceof DisconnectedError ||
+            e instanceof InputBlockedError
+          )
+            throw e;
+          ctx.logError?.(e, `第 ${seen.size} 题填答异常`);
           permitted = false;
           continue;
         }
         expected.set(q.id, { q, answers });
       }
+      if (consecutiveAiFailures >= 3) break;
       if (!snapshot.single) break;
       permitted = false;
       const next = await tab.query(
         ".single-btn-next:not(.next-disabled):not([disabled])",
-        { timeout: 3000, signal: ctx.lease.signal },
+        { visible: true, timeout: 3000, signal: ctx.lease.signal },
       );
       if (!next) break;
       ctx.auth.assert(ctx.lease);
+      const previousIds = snapshot.questions.map((q) => q.id).join("\n");
       await next.click({
         signal: ctx.lease.signal,
         timeout: 5000,
         guard: () => ctx.auth.assert(ctx.lease),
       });
-      await sleep(700, ctx.lease.signal);
-      snapshot = await extractQuestions(tab, ctx.lease.signal);
+      snapshot = await until(
+        async () => {
+          const current = await extractQuestions(tab, ctx.lease.signal);
+          return current.questions.length &&
+            current.questions.map((q) => q.id).join("\n") !== previousIds
+            ? current
+            : false;
+        },
+        5000,
+        ctx.lease.signal,
+        200,
+      ).catch(() => extractQuestions(tab, ctx.lease.signal));
       if (round === 499)
         throw new ReviewRequired(
           "question_parse_error",
@@ -579,17 +640,29 @@ export async function runExam(
       !(await clickText(tab, ["我要交卷"], ctx.lease.signal, undefined, verify))
     )
       throw new ReviewRequired("submission_unverified", "未找到交卷按钮");
-    await sleep(1000, ctx.lease.signal);
+    const modalSelector =
+      '.el-dialog button,.ant-modal button,.dialog button,[role="dialog"] button';
+    await tab
+      .locator(modalSelector)
+      .waitFor?.({
+        state: "visible",
+        timeout: 5000,
+        signal: ctx.lease.signal,
+      })
+      .catch((e) => {
+        if (ctx.lease.signal.aborted) throw e;
+      });
     verify();
-    if (
-      !(await clickText(
+    const confirmed =
+      (await clickText(
         tab,
         ["确定"],
         ctx.lease.signal,
-        ".el-dialog button,.ant-modal button,.dialog button,button",
+        modalSelector,
         verify,
-      ))
-    )
+      )) ||
+      (await clickText(tab, ["确定"], ctx.lease.signal, "button", verify));
+    if (!confirmed)
       throw new ReviewRequired("submission_unverified", "交卷确认未完成");
     const after = await until(
       async () => {
@@ -630,6 +703,6 @@ export async function runExam(
       );
     throw e;
   } finally {
-    if (!keep) await tab.close();
+    if (!keep) await tab.close().catch(() => {});
   }
 }

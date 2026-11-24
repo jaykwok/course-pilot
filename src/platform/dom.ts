@@ -1,5 +1,7 @@
 import {
   ActionabilityError,
+  InputActionError,
+  StaleElementError,
   type Tab,
   type Element as BrowserElement,
 } from "nodriver-ts";
@@ -19,30 +21,42 @@ export async function continueArchivedCourse(
       signal,
     },
   )) {
-    if (!/归档/.test(await dialog.text({ timeout: 3000, signal }))) continue;
-    for (const button of await dialog.queryAll(
-      'button,.btn,a,span,[role="button"],[id$="goOnStudy"]',
-      {
-        visible: true,
-        timeout: 3000,
-        signal,
-      },
-    )) {
-      if (
-        (await button.text({ timeout: 3000, signal })).replace(/\s/g, "") !==
-        "继续学习"
-      )
-        continue;
-      if (!(await button.isEnabled({ timeout: 3000, signal }))) continue;
-      await button.click({ signal, timeout: 5000, guard });
-      await waitForOverlayExit(
-        tab,
-        ".study-transition-page,.ant-modal-content",
-        signal,
-        guard,
-        "归档",
-      );
-      return true;
+    try {
+      if (!/归档/.test(await dialog.text({ timeout: 3000, signal }))) continue;
+      for (const button of await dialog.queryAll(
+        'button,.btn,a,span,[role="button"],[id$="goOnStudy"]',
+        {
+          visible: true,
+          timeout: 3000,
+          signal,
+        },
+      )) {
+        try {
+          if (
+            (await button.text({ timeout: 3000, signal })).replace(
+              /\s/g,
+              "",
+            ) !== "继续学习"
+          )
+            continue;
+          if (!(await button.isEnabled({ timeout: 3000, signal }))) continue;
+          await button.click({ signal, timeout: 5000, guard });
+          await waitForOverlayExit(
+            tab,
+            ".study-transition-page,.ant-modal-content",
+            signal,
+            guard,
+            "归档",
+          );
+          return true;
+        } catch (error) {
+          if (error instanceof StaleElementError) continue;
+          throw error;
+        }
+      }
+    } catch (error) {
+      if (error instanceof StaleElementError) continue;
+      throw error;
     }
   }
   return false;
@@ -124,15 +138,22 @@ export async function clickText(
     timeout: 5000,
     signal,
   })) {
-    const value = await element.evaluate(
-      (e) => ({
-        text: (e.innerText || e.textContent || "").replace(/\s/g, ""),
-        disabled:
-          e.matches(":disabled") || e.getAttribute("aria-disabled") === "true",
-      }),
-      undefined,
-      { timeout: 3000, signal },
-    );
+    let value;
+    try {
+      value = await element.evaluate(
+        (e) => ({
+          text: (e.innerText || e.textContent || "").replace(/\s/g, ""),
+          disabled:
+            e.matches(":disabled") ||
+            e.getAttribute("aria-disabled") === "true",
+        }),
+        undefined,
+        { timeout: 3000, signal },
+      );
+    } catch (error) {
+      if (error instanceof StaleElementError) continue;
+      throw error;
+    }
     if (wanted.includes(value.text) && !value.disabled) {
       await element.click({ signal, timeout: 5000, guard });
       return true;
@@ -172,6 +193,30 @@ export function accessProblem({
     )
   )
     return "denied";
+}
+export function throwIfAccessProblem(signals: {
+  challenge?: boolean;
+  title?: string;
+  notices?: string[];
+}) {
+  if (!signals || !Array.isArray(signals.notices)) return;
+  const problem = accessProblem({
+    challenge: !!signals.challenge,
+    title: signals.title || "",
+    notices: signals.notices,
+  });
+  if (problem === "authentication")
+    throw new AuthenticationError("平台要求验证或暂时限制访问，本轮已停止");
+  if (problem === "concurrent")
+    throw new AuthenticationError(
+      "平台提示已有其他学习会话，请结束其他会话后继续",
+    );
+  if (problem === "denied")
+    throw new ReviewRequired(
+      "access_denied",
+      "当前账号无法访问此课程",
+      "blocked",
+    );
 }
 export async function inspectAccess(tab: Tab, signal: AbortSignal) {
   const signals = await tab.evaluate(
@@ -213,19 +258,7 @@ export async function inspectAccess(tab: Tab, signal: AbortSignal) {
     undefined,
     { timeout: 5000, signal },
   );
-  const problem = accessProblem(signals);
-  if (problem === "authentication")
-    throw new AuthenticationError("平台要求验证或暂时限制访问，本轮已停止");
-  if (problem === "concurrent")
-    throw new AuthenticationError(
-      "平台提示已有其他学习会话，请结束其他会话后继续",
-    );
-  if (problem === "denied")
-    throw new ReviewRequired(
-      "access_denied",
-      "当前账号无法访问此课程",
-      "blocked",
-    );
+  throwIfAccessProblem(signals);
 }
 export async function dismissOverlays(tab: Tab, signal: AbortSignal) {
   const elements = await tab.queryAll(
@@ -233,22 +266,34 @@ export async function dismissOverlays(tab: Tab, signal: AbortSignal) {
     { visible: true, timeout: 5000, signal },
   );
   for (const element of elements.slice(-2)) {
-    const business = await element.evaluate(
-      (e) => {
-        const d = e.closest(
-          '.ant-modal-content,[role="dialog"],.dialog,[data-region="modal:modal"]',
-        );
-        return (
-          !!d &&
-          (!!d.querySelector(".ant-rate,.preview-list,.answer-input-shot") ||
-            /归档|继续学习|我要交卷|确认交卷|提交试卷|评分|评价/.test(
-              d.textContent || "",
-            ))
-        );
-      },
-      undefined,
-      { timeout: 3000, signal },
-    );
-    if (!business) await element.click({ signal, timeout: 3000 });
+    try {
+      const business = await element.evaluate(
+        (e) => {
+          const d = e.closest(
+            '.ant-modal-content,.el-dialog,.modal,[role="dialog"],.dialog,[data-region="modal:modal"]',
+          );
+          return (
+            !!d &&
+            (!!d.querySelector(".ant-rate,.preview-list,.answer-input-shot") ||
+              /归档|继续学习|我要交卷|确认交卷|提交试卷|评分|评价/.test(
+                d.textContent || "",
+              ))
+          );
+        },
+        undefined,
+        { timeout: 3000, signal },
+      );
+      if (!business) await element.click({ signal, timeout: 3000 });
+    } catch (error) {
+      if (error instanceof InputActionError) {
+        const cleanup = await error.cleanup;
+        signal.throwIfAborted();
+        if (cleanup.status === "completed" && error.report.dispatched === 0)
+          continue;
+        throw error;
+      }
+      if (error instanceof StaleElementError) continue;
+      throw error;
+    }
   }
 }

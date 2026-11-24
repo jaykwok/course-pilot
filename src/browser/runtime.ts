@@ -12,7 +12,20 @@ import {
 import { prepareProjectProfile } from "./profile.ts";
 import type { Logger } from "../log.ts";
 const loopback = (host: string) =>
-  ["127.0.0.1", "localhost", "::1", "[::1]"].includes(host.replace(/^\./, ""));
+  ["127.0.0.1", "localhost", "::1", "[::1]"].includes(
+    host.replace(/^\./, "").toLowerCase(),
+  );
+
+function validClearDomain(raw: string): string | undefined {
+  const host = raw.replace(/^\./, "").trim();
+  if (!host || host.includes(":")) return undefined;
+  try {
+    const parsed = new URL(`http://${host}/`).hostname;
+    return parsed && !loopback(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export const FORBIDDEN_CDP = new Set([
   "Runtime.enable",
@@ -65,6 +78,7 @@ export class BrowserRuntime {
     "https://ctexpert.cn",
   ]);
   private unsubscribe: () => void;
+  private unsubscribeErrors: () => void;
   private constructor(browser: Browser, logger: Logger) {
     this.browser = browser;
     this.context = browser.defaultContext;
@@ -80,7 +94,9 @@ export class BrowserRuntime {
       "Target.targetInfoChanged",
       ({ targetInfo }) => this.note(targetInfo.url),
     );
-    browser.errors.on((error) => logger.log(error, "warn"));
+    this.unsubscribeErrors = browser.errors.on((error) =>
+      logger.log(error, "warn"),
+    );
   }
   static async launch(
     logger: Logger,
@@ -107,7 +123,6 @@ export class BrowserRuntime {
           "--profile-directory=Default",
           "--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWebRTC,msForceBrowserSignIn,msImplicitSignin,msEdgeOnRampFRE",
         ],
-        onError: (e) => logger.log(e, "warn"),
       });
       return new BrowserRuntime(browser, logger);
     } catch (error) {
@@ -152,13 +167,21 @@ export class BrowserRuntime {
       this.startupTab = tab;
   }
   async openManagement(url: string) {
-    this.management = this.takeStartupTab() || (await this.context.newTab());
-    await this.management.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: 30000,
-    });
-    await this.management.bringToFront();
-    return this.management;
+    const reused = this.takeStartupTab();
+    const tab = reused || (await this.context.newTab());
+    try {
+      await tab.goto(url, {
+        waitUntil: "domcontentloaded",
+        timeout: 30000,
+      });
+      await tab.bringToFront();
+      this.management = tab;
+      return tab;
+    } catch (error) {
+      if (reused) this.returnStartupTab(reused);
+      else await tab.close().catch(() => {});
+      throw error;
+    }
   }
   scope(signal: AbortSignal) {
     return new TabScope(this, signal);
@@ -167,8 +190,16 @@ export class BrowserRuntime {
     signal?.throwIfAborted();
     // Close platform pages first; they must not repopulate storage during invalidation.
     const closing = this.context.tabScope();
-    for (const tab of this.context.tabs)
-      if (tab !== this.management && !tab.url.startsWith("http://127.0.0.1:")) {
+    const liveTabs = this.context.tabs.filter((tab) => !tab.closed);
+    // Keep at least one blank/local tab alive when management isn't open so Chrome doesn't exit.
+    const keeper =
+      this.management ||
+      liveTabs.find((tab) => tab.url.startsWith("http://127.0.0.1:")) ||
+      (liveTabs.length === 1 && liveTabs[0].url === "about:blank"
+        ? liveTabs[0]
+        : undefined);
+    for (const tab of liveTabs)
+      if (tab !== keeper && !tab.url.startsWith("http://127.0.0.1:")) {
         this.note(tab.url);
         for (const origin of tab.origins) this.note(origin);
         closing.adopt(tab);
@@ -176,12 +207,14 @@ export class BrowserRuntime {
     await closing.close();
     this.retained.clear();
     signal?.throwIfAborted();
-    const domains = new Set(
-      [...this.origins].map((origin) => new URL(origin).hostname),
-    );
+    const domains = new Set<string>();
+    for (const origin of this.origins) {
+      const host = validClearDomain(new URL(origin).hostname);
+      if (host) domains.add(host);
+    }
     for (const cookie of await this.context.cookies()) {
-      if (!loopback(cookie.domain))
-        domains.add(cookie.domain.replace(/^\./, ""));
+      const host = validClearDomain(cookie.domain);
+      if (host) domains.add(host);
     }
     try {
       return await this.context.clearSiteData({
@@ -211,6 +244,7 @@ export class BrowserRuntime {
   }
   async close() {
     this.unsubscribe();
+    this.unsubscribeErrors();
     await this.browser.close();
   }
 }
@@ -229,7 +263,8 @@ export class TabScope {
     this.abortListener = () => {
       void this.close().catch(() => {});
     };
-    signal.addEventListener("abort", this.abortListener, { once: true });
+    if (signal.aborted) void this.close().catch(() => {});
+    else signal.addEventListener("abort", this.abortListener, { once: true });
   }
   get tabs(): Tab[] {
     return [...this.pages.tabs, ...this.borrowed].filter((tab) => !tab.closed);
@@ -263,7 +298,12 @@ export class TabScope {
     // Preserve the review page while still owning any popups it opens this round.
     this.pages.borrow(tab);
     this.borrowed.add(tab);
-    this.runtime.retained.add(tab);
+    if (!this.runtime.retained.has(tab)) {
+      this.runtime.retained.add(tab);
+      tab.onClose.on(() => {
+        this.runtime.retained.delete(tab);
+      });
+    }
   }
   close(): Promise<void> {
     return (this.closing ??= (async () => {

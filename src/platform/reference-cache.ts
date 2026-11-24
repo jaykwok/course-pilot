@@ -44,11 +44,20 @@ export class ReferenceCache {
   ) {
     const previous = (await readJson(join(this.output, "manifest.json"))) as
       typeof this.manifest | null;
-    if (!previous) return;
-    if (!Array.isArray(previous.files) || !Array.isArray(previous.failures))
+    if (previous === null) return;
+    if (
+      !previous ||
+      typeof previous !== "object" ||
+      !Array.isArray(previous.files) ||
+      !Array.isArray(previous.failures)
+    )
       throw new Error("资料清单格式损坏，请保留文件后检查");
     this.manifest.failures = previous.failures.filter(
-      (f) => f && typeof f.course === "string" && typeof f.message === "string",
+      (f) =>
+        f &&
+        typeof f.course === "string" &&
+        typeof f.message === "string" &&
+        (f.resource === undefined || typeof f.resource === "string"),
     );
     const read = async (name: string, size?: number, sha?: string) => {
       if (

@@ -1,6 +1,12 @@
-import type { Tab } from "nodriver-ts";
+import {
+  isContextGone,
+  SessionEndedError,
+  StaleElementError,
+  TimeoutError,
+  type Tab,
+} from "nodriver-ts";
 import type { Protocol } from "devtools-protocol";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { HOME, CENTER, PLATFORM } from "../config.ts";
 import {
@@ -41,7 +47,6 @@ export class Authentication {
     this.path = join(directory, "credentials.json");
   }
   read(): Credential | undefined {
-    if (!existsSync(this.path)) return undefined;
     try {
       const c = JSON.parse(readFileSync(this.path, "utf8"));
       if (
@@ -68,7 +73,11 @@ export class Authentication {
     }
   }
   fileFingerprint() {
-    return existsSync(this.path) ? digest(readFileSync(this.path, "utf8")) : "";
+    try {
+      return digest(readFileSync(this.path, "utf8"));
+    } catch {
+      return "";
+    }
   }
   dashboard() {
     const c = this.read(),
@@ -101,8 +110,9 @@ export class Authentication {
     this.rejectedFingerprint = this.fileFingerprint();
   }
   async forget(signal?: AbortSignal) {
-    await this.clear(signal);
+    signal?.throwIfAborted();
     await atomicJson(this.path, { version: 2, cookies: [] });
+    await this.clear(signal);
   }
   async profile(
     scope: TabScope,
@@ -121,7 +131,7 @@ export class Authentication {
           location.origin === "https://center.mylearning.cn" &&
           !!localStorage.getItem("token"),
         undefined,
-        { timeout, signal: scope.signal },
+        { timeout, signal: scope.signal, world: "isolated" },
       );
       const token = await tab.evaluate(
         () => {
@@ -150,7 +160,12 @@ export class Authentication {
         throw new AuthenticationError("平台账号核验被拒绝，请更新登录凭证");
       }
       if (!response.ok) throw new Error("账号核验失败");
-      const j = JSON.parse(response.body);
+      let j: any;
+      try {
+        j = JSON.parse(response.body);
+      } catch {
+        throw new Error("账号核验返回非 JSON 响应");
+      }
       if (
         j.code !== 0 ||
         !["string", "number"].includes(typeof j.data?.id) ||
@@ -162,7 +177,7 @@ export class Authentication {
         name: String(j.data.name || ""),
       };
     } finally {
-      if (!existing) await tab.close();
+      if (!existing) await tab.close().catch(() => {});
     }
   }
   async login(scope: TabScope, report: (text: string) => void) {
@@ -189,7 +204,7 @@ export class Authentication {
     this.fingerprint = this.fileFingerprint();
     this.verified = true;
     this.rejectedFingerprint = "";
-    await tab.close();
+    await tab.close().catch(() => {});
     report(`已登录 ${profile.name || profile.account}`);
   }
   async lease(scope: TabScope): Promise<Lease> {
@@ -217,8 +232,20 @@ export class Authentication {
       let profile;
       try {
         profile = await this.profile(scope, 30000, home);
+      } catch (error) {
+        if (
+          !scope.signal.aborted &&
+          !(error instanceof AuthenticationError) &&
+          (error instanceof TimeoutError ||
+            (error instanceof Error &&
+              /账号标识缺失|非 JSON|未登录/.test(error.message)))
+        ) {
+          this.invalidate();
+          throw new AuthenticationError("平台登录凭证已失效，请重新登录");
+        }
+        throw error;
       } finally {
-        await home.close();
+        await home.close().catch(() => {});
       }
       if (profile.account !== c.account) {
         this.invalidate();
@@ -258,79 +285,93 @@ export class Authentication {
     this.assert(lease);
     const wanted = entry(url, lease.account);
     const tab = existing || (await scope.open(wanted.url));
-    if (existing)
-      await tab.goto(wanted.url, {
-        signal: lease.signal,
-        timeout: 30000,
-        waitUntil: "domcontentloaded",
-      });
-    if (isCasePoolUrl(wanted.url)) {
-      try {
+    try {
+      if (existing)
+        await tab.goto(wanted.url, {
+          signal: lease.signal,
+          timeout: 30000,
+          waitUntil: "domcontentloaded",
+        });
+      if (isCasePoolUrl(wanted.url)) {
         await waitForCasePoolSession(tab, lease.signal, () =>
           this.assert(lease),
         );
         return tab;
-      } catch (error) {
-        await tab.close();
-        throw error;
       }
-    }
-    let reopened = false;
-    await until(
-      async () => {
-        this.assert(lease);
-        if (tab.closed) throw new Error("任务页面已关闭");
-        const actual = (() => {
-          try {
-            return entry(tab.url, lease.account);
-          } catch {
-            return undefined;
-          }
-        })();
-        if (actual && (wanted.kind === "entry" || actual.id === wanted.id)) {
-          const ready = await tab.evaluate(
-            () => {
-              const login = [
-                ...document.querySelectorAll(
-                  "input[type=password],#esurfingloginiframe",
-                ),
-              ].some((e) => e.getBoundingClientRect().height > 0);
-              return (
-                !login &&
-                !/(?:\/login|\/sso|\/oauth|\/authorize)(?:[/?#]|$)/i.test(
-                  location.pathname + location.hash.split("?")[0],
-                )
-              );
-            },
-            undefined,
-            { timeout: 5000, signal: lease.signal },
-          );
-          if (ready) return true;
-        }
-        if (
-          !reopened &&
-          actual?.kind === "entry" &&
-          new URL(tab.url).hostname === "kc.zhixueyun.com" &&
-          wanted.kind !== "entry"
-        ) {
-          const profile = await this.profile(scope);
-          if (accountId(profile.account) !== lease.account)
-            throw new AuthenticationError("认证回跳账号不一致");
+      let reopened = false;
+      await until(
+        async () => {
           this.assert(lease);
-          await tab.goto(url, {
-            signal: lease.signal,
-            timeout: 30000,
-            waitUntil: "domcontentloaded",
-          });
-          reopened = true;
-        }
-        return false;
-      },
-      45000,
-      lease.signal,
-      500,
-    );
-    return tab;
+          if (tab.closed) throw new Error("任务页面已关闭");
+          const actual = (() => {
+            try {
+              return entry(tab.url, lease.account);
+            } catch {
+              return undefined;
+            }
+          })();
+          if (actual && (wanted.kind === "entry" || actual.id === wanted.id)) {
+            try {
+              const ready = await tab.evaluate(
+                () => {
+                  const login = [
+                    ...document.querySelectorAll(
+                      "input[type=password],#esurfingloginiframe",
+                    ),
+                  ].some((e) => e.getBoundingClientRect().height > 0);
+                  return (
+                    !login &&
+                    !/(?:\/login|\/sso|\/oauth|\/authorize)(?:[/?#]|$)/i.test(
+                      location.pathname + location.hash.split("?")[0],
+                    )
+                  );
+                },
+                undefined,
+                { timeout: 5000, signal: lease.signal, world: "isolated" },
+              );
+              if (ready) return true;
+            } catch (error) {
+              lease.signal.throwIfAborted();
+              if (
+                error instanceof StaleElementError ||
+                error instanceof TimeoutError ||
+                isContextGone(error) ||
+                (error instanceof SessionEndedError && !tab.closed)
+              )
+                return false;
+              throw error;
+            }
+          }
+          if (
+            !reopened &&
+            actual?.kind === "entry" &&
+            new URL(tab.url).hostname === "kc.zhixueyun.com" &&
+            wanted.kind !== "entry"
+          ) {
+            const profile = await this.profile(scope);
+            if (accountId(profile.account) !== lease.account) {
+              this.invalidate();
+              throw new AuthenticationError("认证回跳账号不一致");
+            }
+            this.assert(lease);
+            await tab.goto(wanted.url, {
+              signal: lease.signal,
+              timeout: 30000,
+              waitUntil: "domcontentloaded",
+            });
+            reopened = true;
+          }
+          return false;
+        },
+        45000,
+        lease.signal,
+        500,
+      );
+      return tab;
+    } catch (error) {
+      if (!existing) await tab.close().catch(() => {});
+      throw error;
+    }
   }
 }
 export function cookieParam(

@@ -76,9 +76,13 @@ export function validateSettings(input: unknown): Settings {
     url.username ||
     url.password ||
     url.search ||
-    url.hash
+    url.hash ||
+    /[?#]/.test(baseURL)
   )
     throw new Error("OpenAI 接口地址格式无效");
+  const apiKey = string(v.openai.apiKey, "API Key", 4096);
+  if (!/^[\x21-\x7e]*$/.test(apiKey))
+    throw new Error("API Key 包含非法或非 ASCII 字符");
   if (!["chat", "responses"].includes(v.openai.protocol))
     throw new Error("仅支持 Chat Completions / Responses 协议");
   if (!["prompt_json", "json_schema"].includes(v.openai.output))
@@ -93,7 +97,7 @@ export function validateSettings(input: unknown): Settings {
     },
     openai: {
       baseURL,
-      apiKey: string(v.openai.apiKey, "API Key", 4096),
+      apiKey,
       model: string(v.openai.model, "模型名称", 256),
       protocol: v.openai.protocol,
       output: v.openai.output,
@@ -127,7 +131,13 @@ export function prepareSettings(
   clearKey = false,
 ): Settings {
   const settings = validateSettings(input);
-  const saved = readSettings(path);
+  let saved: Settings;
+  try {
+    saved = readSettings(path);
+  } catch (error) {
+    if (clearKey || settings.openai.apiKey) saved = defaults();
+    else throw error;
+  }
   settings.openai.apiKey = clearKey
     ? ""
     : settings.openai.apiKey ||

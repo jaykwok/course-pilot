@@ -102,7 +102,7 @@ export function safeUrl(raw: string): URL {
     !["https:", "http:"].includes(url.protocol) ||
     url.username ||
     url.password ||
-    (url.port && !["443", "80"].includes(url.port)) ||
+    url.port ||
     (!platformHost(url.hostname) && !isCasePoolUrl(url))
   )
     throw new Error("请使用网上大学、知学云或天翼专家案例库链接");
@@ -114,7 +114,7 @@ export function normalize(raw: string): string {
     .replace(/&amp;/g, "&")
     .replace(/[，。；]+$/, "");
   let url = safeUrl(value);
-  for (let n = 0; n < 3; n++) {
+  for (let n = 0; n < 4; n++) {
     // Discard callback codes and mobile aliases before storing an entry identity.
     if (isCasePoolUrl(url)) return CASE_POOL;
     // Static topic documents may link back through duplicate slashes or anchors.
@@ -140,7 +140,8 @@ export function normalize(raw: string): string {
       return values[0];
     };
     const embedded = get("url", "redirecturl");
-    if (embedded?.startsWith("http")) {
+    if (embedded && /^https?:/i.test(embedded)) {
+      if (n === 3) throw new Error("链接跳转层数过多");
       url = safeUrl(embedded);
       continue;
     }

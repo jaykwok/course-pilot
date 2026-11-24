@@ -124,86 +124,121 @@ export class AiClient {
       },
       required: ["status", "answers"],
     };
-    const combined = AbortSignal.any([
-      signal,
-      AbortSignal.timeout(this.settings.totalTimeout),
-    ]);
-    for (let n = 0; n <= this.settings.retries; n++) {
-      combined.throwIfAborted();
-      try {
-        let output = "";
-        if (this.settings.protocol === "chat") {
-          const r = await this.client.chat.completions.create(
-            {
-              model: this.settings.model,
-              messages: [
-                { role: "system", content: instructions },
-                { role: "user", content: input },
-              ],
-              ...(this.settings.output === "json_schema"
-                ? {
-                    response_format: {
-                      type: "json_schema" as const,
-                      json_schema: { name: "answer", strict: true, schema },
-                    },
-                  }
-                : {}),
-            },
-            { signal: combined },
-          );
-          if (
-            r.choices.length !== 1 ||
-            r.choices[0].finish_reason !== "stop" ||
-            r.choices[0].message.refusal ||
-            r.choices[0].message.tool_calls?.length
-          )
-            throw new Error("AI 答案未正常完成");
-          output = r.choices[0].message.content || "";
-        } else {
-          const r = await this.client.responses.create(
-            {
-              model: this.settings.model,
-              instructions,
-              input,
-              ...(this.settings.output === "json_schema"
-                ? {
-                    text: {
-                      format: {
+    const controller = new AbortController();
+    const onAbort = () => controller.abort(signal.reason);
+    if (signal.aborted) controller.abort(signal.reason);
+    else signal.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(
+      () => controller.abort(new Error("AI 请求总超时")),
+      this.settings.totalTimeout,
+    );
+    timer.unref?.();
+    const combined = controller.signal;
+    try {
+      for (let n = 0; n <= this.settings.retries; n++) {
+        combined.throwIfAborted();
+        try {
+          let output = "";
+          if (this.settings.protocol === "chat") {
+            const r = await this.client.chat.completions.create(
+              {
+                model: this.settings.model,
+                messages: [
+                  { role: "system", content: instructions },
+                  { role: "user", content: input },
+                ],
+                ...(this.settings.output === "json_schema"
+                  ? {
+                      response_format: {
                         type: "json_schema" as const,
-                        name: "answer",
-                        strict: true,
-                        schema,
+                        json_schema: { name: "answer", strict: true, schema },
                       },
-                    },
-                  }
-                : {}),
-            },
-            { signal: combined },
-          );
-          if (
-            r.status !== "completed" ||
-            r.output.some(
-              (o) =>
-                o.type === "message" &&
-                o.content.some((c) => c.type === "refusal"),
+                    }
+                  : {}),
+              },
+              { signal: combined },
+            );
+            const choices = Array.isArray(r?.choices) ? r.choices : [];
+            if (
+              choices.length !== 1 ||
+              choices[0].finish_reason !== "stop" ||
+              choices[0].message?.refusal ||
+              choices[0].message?.tool_calls?.length
             )
-          )
-            throw new Error("AI 响应未正常完成");
-          output = r.output_text;
+              throw new Error("AI 答案未正常完成");
+            output =
+              typeof choices[0].message?.content === "string"
+                ? choices[0].message.content
+                : "";
+          } else {
+            const r = await this.client.responses.create(
+              {
+                model: this.settings.model,
+                instructions,
+                input,
+                ...(this.settings.output === "json_schema"
+                  ? {
+                      text: {
+                        format: {
+                          type: "json_schema" as const,
+                          name: "answer",
+                          strict: true,
+                          schema,
+                        },
+                      },
+                    }
+                  : {}),
+              },
+              { signal: combined },
+            );
+            const items = Array.isArray(r?.output) ? r.output : [];
+            if (
+              r?.status !== "completed" ||
+              items.some(
+                (o) =>
+                  o?.type === "message" &&
+                  Array.isArray(o.content) &&
+                  o.content.some((c) => c?.type === "refusal"),
+              )
+            )
+              throw new Error("AI 响应未正常完成");
+            output =
+              typeof r.output_text === "string"
+                ? r.output_text
+                : items
+                    .filter(
+                      (o) => o?.type === "message" && Array.isArray(o.content),
+                    )
+                    .flatMap((o: any) => o.content)
+                    .filter(
+                      (c: any) =>
+                        c?.type === "output_text" && typeof c.text === "string",
+                    )
+                    .map((c: any) => c.text)
+                    .join("");
+          }
+          const answers = parseAnswer(output);
+          return validAnswers(q, answers) ? answers : [];
+        } catch (e) {
+          if (combined.aborted) throw combined.reason;
+          const retryable =
+            e instanceof OpenAI.APIConnectionError ||
+            (e instanceof OpenAI.APIError &&
+              [429, 500, 502, 503, 504].includes(e.status || 0));
+          if (!retryable || n === this.settings.retries)
+            throw new Error("AI 请求失败或未返回完整答案", { cause: e });
+          try {
+            await sleep(Math.min(1000 * 2 ** n, 8000), combined);
+          } catch {
+            if (combined.aborted) throw combined.reason;
+            throw e;
+          }
         }
-        const answers = parseAnswer(output);
-        return validAnswers(q, answers) ? answers : [];
-      } catch (e) {
-        if (combined.aborted) throw combined.reason;
-        const retryable =
-          e instanceof OpenAI.APIConnectionError ||
-          (e instanceof OpenAI.APIError &&
-            [429, 500, 502, 503, 504].includes(e.status || 0));
-        if (!retryable || n === this.settings.retries)
-          throw new Error("AI 请求失败或未返回完整答案");
-        await sleep(Math.min(1000 * 2 ** n, 8000), combined);
       }
+      return [];
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
     }
-    return [];
   }
 }

@@ -1,7 +1,29 @@
-import type { Tab } from "nodriver-ts";
+import {
+  EvaluationError,
+  FetchCancelledError,
+  isContextGone,
+  StaleElementError,
+  type FetchResponse,
+  type Tab,
+} from "nodriver-ts";
 import { PLATFORM } from "../config.ts";
 import { AuthenticationError, ReviewRequired, sleep } from "../utils.ts";
 import type { Authentication, Lease } from "./auth.ts";
+
+function retryAfterMs(headers?: Record<string, string>): number | undefined {
+  if (!headers) return undefined;
+  const entry = Object.entries(headers).find(
+    ([key]) => key.toLowerCase() === "retry-after",
+  );
+  if (!entry) return undefined;
+  const raw = entry[1].trim();
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0)
+    return Math.min(seconds * 1000, 10000);
+  const dateMs = Date.parse(raw) - Date.now();
+  if (Number.isFinite(dateMs) && dateMs > 0) return Math.min(dateMs, 10000);
+  return undefined;
+}
 
 export class PlatformHttp {
   readonly tab: Tab;
@@ -54,55 +76,91 @@ export class PlatformHttp {
         }
       },
       undefined,
-      { timeout: 30000, signal: this.lease.signal },
+      { timeout: 30000, signal: this.lease.signal, world: "isolated" },
     );
     for (let attempt = 0; attempt < attempts; attempt++) {
-      const authorization = await this.authorization();
-      // nodriver uses the browser's cookie jar and aborts its fetch on timeout or cancellation.
-      const response = await this.tab.fetch<string>(url.href, {
-        method,
-        credentials: "same-origin",
-        mode: "same-origin",
-        redirect: "error",
-        timeout: 10000,
-        signal: this.lease.signal,
-        responseType: "text",
-        headers: {
-          Accept: "application/json",
-          Version: "12.1.1",
-          Authorization: authorization,
-          ...(options.body === undefined
-            ? {}
-            : { "Content-Type": "application/json" }),
-          ...options.headers,
-        },
-        body:
-          options.body === undefined
-            ? undefined
-            : typeof options.body === "string"
-              ? options.body
-              : JSON.stringify(options.body),
-      });
+      let response: FetchResponse<string>;
+      try {
+        const authorization = await this.authorization();
+        // nodriver uses the browser's cookie jar and aborts its fetch on timeout or cancellation.
+        response = await this.tab.fetch<string>(url.href, {
+          method,
+          credentials: "same-origin",
+          mode: "same-origin",
+          redirect: "manual",
+          timeout: 10000,
+          signal: this.lease.signal,
+          responseType: "text",
+          headers: {
+            Accept: "application/json",
+            Version: "12.1.1",
+            Authorization: authorization,
+            ...(options.body === undefined
+              ? {}
+              : { "Content-Type": "application/json" }),
+            ...options.headers,
+          },
+          body:
+            options.body === undefined
+              ? undefined
+              : typeof options.body === "string"
+                ? options.body
+                : JSON.stringify(options.body),
+        });
+      } catch (error) {
+        this.auth.assert(this.lease);
+        const transient =
+          (error instanceof FetchCancelledError &&
+            error.aborted &&
+            !this.lease.signal.aborted) ||
+          (error instanceof EvaluationError &&
+            /Failed to fetch|NetworkError/i.test(error.message)) ||
+          error instanceof StaleElementError ||
+          isContextGone(error);
+        if (transient && attempt + 1 < attempts) {
+          await sleep(250 * 2 ** attempt, this.lease.signal);
+          continue;
+        }
+        throw error;
+      }
       this.auth.assert(this.lease);
-      if (response.status === 401 || response.status === 403) {
+      if (
+        response.type === "opaqueredirect" ||
+        response.status === 401 ||
+        response.status === 403
+      ) {
         this.auth.invalidate();
         throw new AuthenticationError(
           "平台登录状态失效或访问被拒绝，请重新登录",
         );
       }
       if (
-        [429, 502, 503, 504].includes(response.status) &&
+        [408, 429, 502, 503, 504].includes(response.status) &&
         attempt + 1 < attempts
       ) {
-        await sleep(250 * 2 ** attempt, this.lease.signal);
+        const waitMs =
+          (response.status === 429
+            ? retryAfterMs(response.headers)
+            : undefined) ?? 250 * 2 ** attempt;
+        await sleep(waitMs, this.lease.signal);
         continue;
       }
       // Error JSON may omit Content-Type; non-JSON errors still retain their HTTP status.
       let value: any = null;
       try {
         value = JSON.parse(response.body);
-      } catch (error) {
-        if (response.ok) throw error;
+      } catch {
+        if (response.ok) {
+          if (attempt + 1 < attempts) {
+            await sleep(250 * 2 ** attempt, this.lease.signal);
+            continue;
+          }
+          throw new ReviewRequired(
+            "platform_rejected",
+            `平台接口返回非 JSON 响应（${method} ${url.pathname}）`,
+            "retry",
+          );
+        }
       }
       if (!response.ok && value?.errorCode !== undefined) {
         // Translation is supplementary; a missing SPA module must not replace
@@ -163,15 +221,23 @@ export class PlatformHttp {
       () => {
         if (location.origin !== "https://kc.zhixueyun.com")
           throw new Error("平台页面未就绪");
+        const safeDecode = (raw: string | undefined) => {
+          if (!raw) return "";
+          try {
+            return decodeURIComponent(raw);
+          } catch {
+            return "";
+          }
+        };
         const cookie = document.cookie.match(
           /(?:^|; )authorization=([^;]+)/,
         )?.[1];
-        let auth = cookie ? decodeURIComponent(cookie) : "";
+        let auth = safeDecode(cookie);
         if (!auth)
-          auth = decodeURIComponent(
+          auth = safeDecode(
             localStorage
               .getItem("save_cookie")
-              ?.match(/(?:^|;\s*)authorization=([^;]+)/)?.[1] || "",
+              ?.match(/(?:^|;\s*)authorization=([^;]+)/)?.[1],
           );
         if (!auth) {
           try {

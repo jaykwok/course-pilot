@@ -14,13 +14,17 @@ export async function until<T>(
   signal?: AbortSignal,
   interval = 250,
 ): Promise<Exclude<T, null | undefined | false | 0 | "">> {
+  check(signal);
   const end = Date.now() + timeout;
   while (Date.now() < end) {
     check(signal);
     const result = await fn();
     if (result) return result as Exclude<T, null | undefined | false | 0 | "">;
-    await sleep(interval, signal);
+    const remaining = end - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(interval, remaining), signal);
   }
+  check(signal);
   throw new Error("等待平台响应超时");
 }
 export function object(value: unknown): Record<string, any> {

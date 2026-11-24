@@ -90,12 +90,13 @@ export async function applyLoginPreferences(tab: Tab, signal: AbortSignal) {
           await checkbox.click(options);
       }
     } catch (error) {
-      signal.throwIfAborted();
       if (error instanceof InputActionError) {
         const cleanup = await error.cleanup;
+        signal.throwIfAborted();
         if (cleanup.status !== "completed") throw error;
         error = error.cause;
       }
+      signal.throwIfAborted();
       // A mode switch can hide an attached node after the visible query, before
       // native scrolling. The next login poll must locate the current controls.
       if (
@@ -139,7 +140,13 @@ export async function waitForLoginReturn(tab: Tab, signal: AbortSignal) {
       signal.throwIfAborted();
       if (tab.closed)
         throw new AuthenticationError("登录窗口已关闭，原凭证未更新");
-      if (!(error instanceof TimeoutError)) throw error;
+      if (!(
+        error instanceof TimeoutError ||
+        error instanceof StaleElementError ||
+        isContextGone(error) ||
+        (error instanceof SessionEndedError && !tab.closed)
+      ))
+        throw error;
     }
   }
 }

@@ -1,4 +1,11 @@
-import { ActionabilityError, InputActionError, type Tab } from "nodriver-ts";
+import {
+  ActionabilityError,
+  DisconnectedError,
+  InputActionError,
+  InputBlockedError,
+  StaleElementError,
+  type Tab,
+} from "nodriver-ts";
 import type { Configuration } from "../config.ts";
 import type { Task } from "../storage/repository.ts";
 import { resource } from "../domain/identity.ts";
@@ -114,11 +121,22 @@ export async function progress(
 }
 async function selectCourseTab(tab: Tab, ctx: DiscoveryContext) {
   ctx.auth.assert(ctx.lease);
+  const alreadySelected = await tab
+    .evaluate(
+      () =>
+        [...document.querySelectorAll(".guide-tab--selected")].some(
+          (e) => (e.textContent || "").replace(/\s/g, "") === "课程学习",
+        ),
+      undefined,
+      { timeout: 3000, signal: ctx.lease.signal, world: "isolated" },
+    )
+    .catch(() => false);
+  if (alreadySelected === true) return;
   const switched = await clickText(
     tab,
     ["课程学习"],
     ctx.lease.signal,
-    '.guide-tab > *:not(.guide-tab--selected),.guide-tab span:not(.guide-tab--selected),.guide-tab button:not(.guide-tab--selected),.guide-tab a:not(.guide-tab--selected),.guide-tab--item:not(.guide-tab--selected),[class*="guide-tab"]:not(.guide-tab--selected)',
+    ".guide-tab > *:not(.guide-tab--selected),.guide-tab span:not(.guide-tab--selected),.guide-tab button:not(.guide-tab--selected),.guide-tab a:not(.guide-tab--selected),.guide-tab--item:not(.guide-tab--selected)",
     () => ctx.auth.assert(ctx.lease),
   );
   if (switched)
@@ -141,12 +159,12 @@ async function revealChapterRow(
   rowSelector: string,
   dlSelector: string,
   signal: AbortSignal,
-) {
-  await tab.evaluate(
+): Promise<boolean> {
+  return await tab.evaluate(
     ({ rowSelector, dlSelector }) => {
       const target = (document.querySelector(rowSelector) ||
         document.querySelector(dlSelector)) as HTMLElement | null;
-      if (!target) return;
+      if (!target) return false;
       const container = target.closest(".jspContainer") as HTMLElement | null;
       const scrollable = container?.parentElement as HTMLElement | null;
       const $ = (window as any).$;
@@ -171,6 +189,7 @@ async function revealChapterRow(
         if (rect.top < 16 || rect.bottom > innerHeight - 16)
           window.scrollBy(0, rect.top + rect.height / 2 - innerHeight / 2);
       }
+      return true;
     },
     { rowSelector, dlSelector },
     { timeout: 3000, signal },
@@ -207,35 +226,40 @@ async function rating(tab: Tab, ctx: DiscoveryContext) {
     timeout: 5000,
     signal: ctx.lease.signal,
   })) {
-    const star = await dialog.query(".ant-rate li:nth-child(5)", {
-      visible: true,
-      timeout: 3000,
-      signal: ctx.lease.signal,
-    });
-    if (!star) continue;
-    await star.click({
-      signal: ctx.lease.signal,
-      timeout: 5000,
-      guard: () => ctx.auth.assert(ctx.lease),
-    });
-    for (const button of await dialog.queryAll("button:not([disabled])", {
-      visible: true,
-      timeout: 3000,
-      signal: ctx.lease.signal,
-    }))
-      if (
-        (
-          await button.text({ timeout: 3000, signal: ctx.lease.signal })
-        ).replace(/\s/g, "") === "确定" &&
-        (await button.isEnabled({ timeout: 3000, signal: ctx.lease.signal }))
-      ) {
-        await button.click({
-          signal: ctx.lease.signal,
-          timeout: 5000,
-          guard: () => ctx.auth.assert(ctx.lease),
-        });
-        break;
-      }
+    try {
+      const star = await dialog.query(".ant-rate li:nth-child(5)", {
+        visible: true,
+        timeout: 3000,
+        signal: ctx.lease.signal,
+      });
+      if (!star) continue;
+      await star.click({
+        signal: ctx.lease.signal,
+        timeout: 5000,
+        guard: () => ctx.auth.assert(ctx.lease),
+      });
+      for (const button of await dialog.queryAll("button:not([disabled])", {
+        visible: true,
+        timeout: 3000,
+        signal: ctx.lease.signal,
+      }))
+        if (
+          (
+            await button.text({ timeout: 3000, signal: ctx.lease.signal })
+          ).replace(/\s/g, "") === "确定" &&
+          (await button.isEnabled({ timeout: 3000, signal: ctx.lease.signal }))
+        ) {
+          await button.click({
+            signal: ctx.lease.signal,
+            timeout: 5000,
+            guard: () => ctx.auth.assert(ctx.lease),
+          });
+          break;
+        }
+    } catch (error) {
+      if (error instanceof StaleElementError) continue;
+      throw error;
+    }
   }
 }
 export async function activate(tab: Tab, s: Section, ctx: DiscoveryContext) {
@@ -260,12 +284,31 @@ export async function activate(tab: Tab, s: Section, ctx: DiscoveryContext) {
     ctx.auth.assert(ctx.lease);
     // The platform can activate the first chapter itself during page startup.
     if (await focused()) return selector;
-    await revealChapterRow(
-      tab,
-      `${selector} .section-item-wrapper`,
-      selector,
-      ctx.lease.signal,
-    );
+    if (
+      (await revealChapterRow(
+        tab,
+        `${selector} .section-item-wrapper`,
+        selector,
+        ctx.lease.signal,
+      )) === false
+    ) {
+      await tab
+        .locator(selector)
+        .waitFor?.({
+          state: "attached",
+          timeout: 10000,
+          signal: ctx.lease.signal,
+        })
+        .catch((e) => {
+          if (ctx.lease.signal.aborted) throw e;
+        });
+      await revealChapterRow(
+        tab,
+        `${selector} .section-item-wrapper`,
+        selector,
+        ctx.lease.signal,
+      );
+    }
     try {
       await row.click(input);
     } catch (error) {
@@ -317,14 +360,27 @@ async function resumeMedia(tab: Tab, selector: string, ctx: DiscoveryContext) {
   );
   if (!focused) return;
   // Video.js needs a genuine input gesture to unlock playback on a fresh profile.
+  // Exclude .vjs-ended so finished videos are never restarted from 0:00.
   const play = await tab.query(
-    ".video-js.vjs-paused .vjs-big-play-button,.video-js.vjs-paused .vjs-play-control",
+    ".video-js.vjs-paused:not(.vjs-ended) .vjs-big-play-button,.video-js.vjs-paused:not(.vjs-ended) .vjs-play-control",
     { visible: true, timeout: 5000, signal: ctx.lease.signal },
   );
-  if (play)
-    await clickPlayerControl(tab, play, ctx.lease.signal, () =>
-      ctx.auth.assert(ctx.lease),
-    );
+  if (play) {
+    try {
+      await clickPlayerControl(tab, play, ctx.lease.signal, () =>
+        ctx.auth.assert(ctx.lease),
+      );
+    } catch (error) {
+      if (error instanceof InputActionError) {
+        const cleanup = await error.cleanup;
+        ctx.lease.signal.throwIfAborted();
+        if (cleanup.status !== "completed" || error.report.dispatched !== 0)
+          throw error;
+      } else if (!(error instanceof StaleElementError)) {
+        throw error;
+      }
+    }
+  }
   await tab.evaluate(
     async (selector) => {
       const target = document.querySelector(selector);
@@ -422,6 +478,7 @@ export async function learn(
             : Math.min(config.sectionTimeout, 300) * 1000;
         let lastTime = -1,
           lastAdvance = Date.now(),
+          endedAt: number | null = null,
           nextCheck = 0,
           finished = false;
         while (Date.now() - start < timeout) {
@@ -431,9 +488,8 @@ export async function learn(
             await inspectAccess(tab, ctx.lease.signal);
             await rating(tab, ctx);
             await dismissOverlays(tab, ctx.lease.signal);
-            await resumeMedia(tab, selector, ctx);
           }
-          const playback = await tab.evaluate(playbackSnapshot, selector, {
+          let playback = await tab.evaluate(playbackSnapshot, selector, {
             timeout: 5000,
             signal: ctx.lease.signal,
           });
@@ -463,7 +519,10 @@ export async function learn(
                 "当前章节焦点已变化",
               );
             }
+            playback = recheck;
           }
+          if (checkPlatform && endedAt === null && !playback.media?.ended)
+            await resumeMedia(tab, selector, ctx);
           const media = playback.media;
           if (video) {
             if (media?.error)
@@ -472,11 +531,21 @@ export async function learn(
               lastAdvance = Date.now();
             }
             if (media) lastTime = media.time;
-            if (
-              Date.now() - lastAdvance > config.stallLimit * 1000 &&
-              !media?.ended
-            )
-              throw new ReviewRequired("video_stalled", "视频长时间未推进");
+            if (media?.ended) {
+              if (endedAt === null) endedAt = Date.now();
+              else if (
+                Date.now() - endedAt >
+                Math.max(config.stallLimit, 60) * 1000
+              )
+                throw new ReviewRequired(
+                  "sync_timeout",
+                  "视频播放结束但平台长时间未确认完成",
+                );
+            } else {
+              endedAt = null;
+              if (Date.now() - lastAdvance > config.stallLimit * 1000)
+                throw new ReviewRequired("video_stalled", "视频长时间未推进");
+            }
           }
           onProgress(
             learningProgress(
@@ -500,7 +569,13 @@ export async function learn(
         if (!finished)
           throw new ReviewRequired("sync_timeout", "平台尚未确认本节完成");
       } catch (e) {
-        if (ctx.lease.signal.aborted || e instanceof AuthenticationError)
+        if (
+          ctx.lease.signal.aborted ||
+          e instanceof AuthenticationError ||
+          e instanceof DisconnectedError ||
+          e instanceof InputBlockedError ||
+          tab.closed
+        )
           throw e;
         ctx.logError?.(e, `章节 ${s.name || s.id} 学习异常`);
         issues.push({
@@ -513,26 +588,31 @@ export async function learn(
       }
     }
     states = await progress(http, task, sections);
+    const unresolved = issues.filter(
+      (issue) =>
+        String(states.get(issue.section.toLowerCase())?.finishStatus) !== "2",
+    );
     const allMedia = sections
       .filter((s) => Number(s.sectionType) !== 9)
       .every(
         (s) => String(states.get(s.id.toLowerCase())?.finishStatus) === "2",
       );
-    if (allMedia && !examsPending && !issues.length)
+    if (allMedia && !examsPending && !unresolved.length)
       ctx.repo.complete(task, {
         source: "course-section-progress",
         sections: [...states.keys()],
         readAt: new Date().toISOString(),
       });
-    else if (issues.length)
+    else if (unresolved.length)
       ctx.repo.review(task, "partial_course_failure", {
         message: "部分章节尚未完成",
-        sections: issues,
-        recovery: issues.some((issue) => issue.recovery === "retry")
+        sections: unresolved,
+        recovery: unresolved.some((issue) => issue.recovery === "retry")
           ? "retry"
           : "blocked",
       });
-    else
+    else {
+      if (allMedia && examsPending) ctx.repo.remove(task.id, "learn");
       ctx.repo.outcome(
         task.id,
         examsPending ? "WAITING_CHILDREN" : "WAITING_SYNC",
@@ -542,14 +622,26 @@ export async function learn(
           residual: !allMedia,
         },
       );
+    }
   } finally {
     onProgress(null);
-    await tab.close();
+    await tab.close().catch(() => {});
   }
 }
 async function learnSubjectLinks(task: Task, ctx: DiscoveryContext) {
   const tab = await ctx.auth.navigate(ctx.scope, task.url, ctx.lease);
   try {
+    await tab
+      .locator?.(".item.current-hover")
+      ?.waitFor?.({
+        state: "attached",
+        timeout: 10000,
+        signal: ctx.lease.signal,
+      })
+      .catch((e) => {
+        if (ctx.lease.signal.aborted) throw e;
+      });
+    await inspectAccess(tab, ctx.lease.signal);
     const items = await tab.evaluate(
       () =>
         [...document.querySelectorAll(".item.current-hover")].map(
@@ -564,10 +656,18 @@ async function learnSubjectLinks(task: Task, ctx: DiscoveryContext) {
     );
     for (const item of items.filter((i) => i.type === "URL" && !i.done)) {
       ctx.auth.assert(ctx.lease);
-      const popup = tab.waitForPopup({
-        timeout: 10000,
-        signal: ctx.lease.signal,
-      });
+      const popupAbort = new AbortController();
+      const onAbort = () => popupAbort.abort(ctx.lease.signal.reason);
+      ctx.lease.signal.addEventListener("abort", onAbort, { once: true });
+      const popup = tab
+        .waitForPopup({
+          timeout: 10000,
+          signal: popupAbort.signal,
+        })
+        .catch((error) => {
+          if (popupAbort.signal.aborted) return undefined;
+          throw error;
+        });
       const click = (async () => {
         const items = await tab.queryAll(".item.current-hover", {
           timeout: 5000,
@@ -584,9 +684,21 @@ async function learnSubjectLinks(task: Task, ctx: DiscoveryContext) {
           guard: () => ctx.auth.assert(ctx.lease),
         });
       })();
-      const [child] = await Promise.all([popup, click]);
-      await sleep(10000, ctx.lease.signal);
-      await child.close();
+      let child: Tab | undefined;
+      try {
+        await click;
+        child = await popup;
+        if (!child) throw new Error("外链页面未打开");
+        await sleep(10000, ctx.lease.signal);
+      } catch (error) {
+        popupAbort.abort(error);
+        const late = await popup.catch(() => undefined);
+        if (late && late !== child) await late.close().catch(() => {});
+        throw error;
+      } finally {
+        ctx.lease.signal.removeEventListener("abort", onAbort);
+        if (child) await child.close().catch(() => {});
+      }
     }
     await tab.reload({
       waitUntil: "domcontentloaded",
@@ -606,6 +718,7 @@ async function learnSubjectLinks(task: Task, ctx: DiscoveryContext) {
       manifest.complete &&
       ctx.repo.task(task.id).details.discoveryComplete === true;
     if (!manifest.residual && discoveryComplete) {
+      ctx.repo.remove(task.id, "learn");
       ctx.repo.remove(task.id, "failure");
       ctx.repo.outcome(task.id, "WAITING_CHILDREN", {
         residual: false,
@@ -637,6 +750,6 @@ async function learnSubjectLinks(task: Task, ctx: DiscoveryContext) {
         },
       );
   } finally {
-    await tab.close();
+    await tab.close().catch(() => {});
   }
 }

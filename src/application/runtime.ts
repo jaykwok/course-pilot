@@ -30,6 +30,7 @@ import {
   exportBundle,
   importBundle,
   IMPORT_INBOX,
+  portableUrl,
   taskIssue,
 } from "../storage/transfer.ts";
 import { buildDiagnosticLog } from "../storage/diagnostics.ts";
@@ -87,6 +88,7 @@ export class Application extends EventEmitter {
   abort?: AbortController;
   stopAfter = false;
   exitRequested = false;
+  exited = false;
   connected = false;
   view: any = {
     title: "自动化挂课工作台",
@@ -146,6 +148,10 @@ export class Application extends EventEmitter {
       this.repo.queue(IMPORT_INBOX, "learn").length +
       this.repo.queue(IMPORT_INBOX, "discover").length;
     const importedExams = this.repo.queue(IMPORT_INBOX, "exam").length;
+    let aiReady = false;
+    try {
+      aiReady = aiConfigured(readSettings(this.config.settingsPath).openai);
+    } catch {}
     return {
       ...auth,
       pending_owner:
@@ -164,9 +170,7 @@ export class Application extends EventEmitter {
         (t) => t.details.recovery === "blocked",
       ).length,
       import_count: importedLearning + importedExams,
-      ai_configured: aiConfigured(
-        readSettings(this.config.settingsPath).openai,
-      ),
+      ai_configured: aiReady,
       recommended:
         auth.credential.status === "missing"
           ? { kind: "login", label: "登录账号" }
@@ -191,10 +195,18 @@ export class Application extends EventEmitter {
             (queue) => [queue, this.repo.queue(account, queue).length],
           ),
         ),
-        failures: this.repo.queue(account, "failure").map((task) => ({
-          url: task.url,
-          ...taskIssue(task),
-        })),
+        failures: this.repo.queue(account, "failure").map((task) => {
+          let url: string;
+          try {
+            url = portableUrl(task.url);
+          } catch {
+            url = redact(task.url);
+          }
+          return {
+            url,
+            ...taskIssue(task),
+          };
+        }),
       })),
     };
   }
@@ -262,7 +274,7 @@ export class Application extends EventEmitter {
     if (this.disconnectTimer) clearTimeout(this.disconnectTimer);
     if (!connected) {
       this.disconnectTimer = setTimeout(() => {
-        if (!this.connected) this.exit();
+        if (!this.connected) this.exit(true);
       }, 10000);
       this.disconnectTimer.unref();
     }
@@ -278,8 +290,6 @@ export class Application extends EventEmitter {
         throw new ProtocolError("重复请求内容不一致");
       return old.result;
     }
-    if (this.requests.size >= 2048)
-      throw new ProtocolError("操作记录已满，请重启服务");
     let result: unknown = { ok: true };
     if (action === "operation") {
       if (this.operationId || this.exitRequested)
@@ -314,10 +324,37 @@ export class Application extends EventEmitter {
       )
         throw new ProtocolError("链接输入过长或无效", 400);
       if (
+        ["clear_queues", "export_queues", "retry_tasks"].includes(
+          payload.kind,
+        ) &&
+        payload.account !== null &&
+        (typeof payload.account !== "string" ||
+          !payload.account ||
+          payload.account.length > 256)
+      )
+        throw new ProtocolError("账号范围无效", 400);
+      if (
         payload.kind === "clear_queues" &&
         !CLEAR_SCOPES.includes(payload.scope)
       )
         throw new ProtocolError("清空范围无效", 400);
+      if (
+        payload.kind === "export_queues" &&
+        !["pending", "failed", "all"].includes(payload.selection)
+      )
+        throw new ProtocolError("导出范围无效", 400);
+      if (
+        payload.kind === "retry_tasks" &&
+        !["retry", "blocked"].includes(payload.recovery)
+      )
+        throw new ProtocolError("重试类型无效", 400);
+      if (
+        payload.kind === "import_queues" &&
+        (!payload.bundle ||
+          typeof payload.bundle !== "object" ||
+          Array.isArray(payload.bundle))
+      )
+        throw new ProtocolError("导入文件格式无效", 400);
       if (
         (payload.kind === "links" || payload.kind === "references") &&
         !payload.input_text?.trim()
@@ -335,7 +372,11 @@ export class Application extends EventEmitter {
       });
       result = { ok: true, operation_id: this.operationId };
       this.active = this.execute(payload.kind, payload)
-        .catch((e) => this.logger.log(e, "error"))
+        .catch((e) => {
+          try {
+            this.logger.log(e, "error");
+          } catch {}
+        })
         .finally(() => {
           this.operationId = null;
           this.kind = null;
@@ -346,7 +387,10 @@ export class Application extends EventEmitter {
             progress: null,
             status: this.exitRequested ? "正在退出" : "就绪",
           });
-          if (this.exitRequested) this.emit("exit");
+          if (this.exitRequested && !this.exited) {
+            this.exited = true;
+            this.emit("exit");
+          }
         });
     } else if (action === "answer") {
       const p = this.view.prompt;
@@ -384,17 +428,26 @@ export class Application extends EventEmitter {
     } else if (action === "exit") this.exit();
     else throw new ProtocolError("未知操作", 400);
     this.requests.set(id, { fingerprint, result });
+    while (this.requests.size > 2048) {
+      const oldest = this.requests.keys().next().value;
+      if (oldest === undefined) break;
+      this.requests.delete(oldest);
+    }
     return result;
   }
-  exit() {
-    if (this.exitRequested) return;
+  exit(force = false) {
+    const already = this.exitRequested;
     this.exitRequested = true;
-    if (this.kind === "learn" && !this.view.prompt) this.stopAfter = true;
-    else this.abort?.abort(new Error("服务正在关闭"));
+    if (force || already || this.kind !== "learn" || this.view.prompt)
+      this.abort?.abort(new Error("服务正在关闭"));
+    else this.stopAfter = true;
     this.promptWaiter?.reject(new Error("服务正在关闭"));
     this.promptWaiter = undefined;
     this.update({ prompt: null });
-    if (!this.operationId) this.emit("exit");
+    if (!this.operationId && !this.exited) {
+      this.exited = true;
+      this.emit("exit");
+    }
   }
   async settled() {
     await this.active;
@@ -479,6 +532,11 @@ export class Application extends EventEmitter {
         const path = join(this.config.dataDir, "exports", filename);
         await atomicJson(path, bundle);
         this.exports.set(id, { path, filename });
+        while (this.exports.size > 64) {
+          const oldest = this.exports.keys().next().value;
+          if (oldest === undefined) break;
+          this.exports.delete(oldest);
+        }
         this.update({
           summary: {
             id: token(),
@@ -494,9 +552,13 @@ export class Application extends EventEmitter {
         return;
       }
       if (kind === "clear_queues") {
-        const scope: (typeof CLEAR_SCOPES)[number] = payload.scope;
-        const removed = await this.repo.clear(payload.account, scope);
-        const message = `已清空 ${removed} 个${scope === "failures" ? "异常" : scope === "exams" ? "考试" : ""}任务，清空前的队列已备份。`;
+        const clearScope: (typeof CLEAR_SCOPES)[number] = payload.scope;
+        const removed = await this.repo.clear(
+          payload.account,
+          clearScope,
+          scope.signal,
+        );
+        const message = `已清空 ${removed} 个${clearScope === "failures" ? "异常" : clearScope === "exams" ? "考试" : ""}任务，清空前的队列已备份。`;
         report(message);
         this.notify(message);
         return;

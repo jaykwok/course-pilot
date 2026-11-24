@@ -19,39 +19,75 @@ export interface QueueBundle {
   sources: { parent: string; child: string; required: boolean }[];
 }
 
-export function portableUrl(raw: string): string {
-  const url = new URL(normalize(raw));
-  const clean = (params: URLSearchParams) => {
-    for (const key of [...params.keys()])
-      if (
-        /token|authorization|cookie|password|secret|^(?:code|ticket|bootstrap|key|api_?key)$/i.test(
-          key,
-        )
-      )
-        params.delete(key);
-  };
-  clean(url.searchParams);
-  if (url.hash.includes("?")) {
-    const [route, query] = url.hash.split("?");
-    const params = new URLSearchParams(query);
-    clean(params);
+const SENSITIVE_PARAM =
+  /token|authorization|cookie|password|secret|^(?:code|ticket|bootstrap|key|api[_-]?key|sso_?ticket|auth_?code|access_?key|session_?id|sid|signature|sig)$/i;
+
+function cleanParams(params: URLSearchParams, depth = 0) {
+  for (const key of [...params.keys()]) {
+    if (SENSITIVE_PARAM.test(key)) {
+      params.delete(key);
+      continue;
+    }
+    if (
+      depth < 2 &&
+      ["paasurl", "url", "redirecturl"].includes(key.toLowerCase())
+    ) {
+      const cleaned = params.getAll(key).map((value) => {
+        try {
+          if (/^https?:/i.test(value)) return stripUrlSecrets(value, depth + 1);
+          const q = value.indexOf("?");
+          if (q >= 0) {
+            const inner = new URLSearchParams(value.slice(q + 1));
+            cleanParams(inner, depth + 1);
+            return value.slice(0, q) + (inner.size ? `?${inner}` : "");
+          }
+        } catch {}
+        return value;
+      });
+      params.delete(key);
+      for (const value of cleaned) params.append(key, value);
+    }
+  }
+}
+
+function stripUrlSecrets(raw: string, depth = 0): string {
+  const url = new URL(raw);
+  cleanParams(url.searchParams, depth);
+  const hashQuery = url.hash.indexOf("?");
+  if (hashQuery >= 0) {
+    const route = url.hash.slice(0, hashQuery);
+    const params = new URLSearchParams(url.hash.slice(hashQuery + 1));
+    cleanParams(params, depth);
     url.hash = route + (params.size ? `?${params}` : "");
   }
-  return normalize(url.href);
+  return url.href;
+}
+
+export function portableUrl(raw: string): string {
+  return normalize(stripUrlSecrets(normalize(raw)));
 }
 
 function issue(value: TaskIssue): TaskIssue {
+  if (!value || typeof value !== "object")
+    throw new Error("任务异常记录格式无效");
+  const recovery: Recovery = value.recovery === "blocked" ? "blocked" : "retry";
+  const sections = Array.isArray(value.sections)
+    ? value.sections
+        .filter((s) => s && typeof s === "object")
+        .slice(0, 500)
+        .map((section) => ({
+          section: section.section == null ? "" : redact(section.section),
+          message: section.message == null ? "" : redact(section.message),
+          recovery: (section.recovery === "blocked"
+            ? "blocked"
+            : "retry") as Recovery,
+        }))
+    : undefined;
   return {
-    reason: redact(value.reason),
-    message: redact(value.message),
-    recovery: value.recovery,
-    ...(value.sections && {
-      sections: value.sections.map((section) => ({
-        section: redact(section.section),
-        message: redact(section.message),
-        recovery: section.recovery,
-      })),
-    }),
+    reason: value.reason == null ? "" : redact(value.reason),
+    message: value.message == null ? "" : redact(value.message),
+    recovery,
+    ...(sections?.length ? { sections } : {}),
   };
 }
 
@@ -66,10 +102,29 @@ export function taskIssue(task: Task): TaskIssue {
 
 /** Normalize links and merge duplicate tasks in the current file format. */
 export function normalizeBundle(bundle: QueueBundle): QueueBundle {
+  if (
+    !bundle ||
+    typeof bundle !== "object" ||
+    Array.isArray(bundle) ||
+    bundle.format !== "course-pilot.tasks" ||
+    bundle.version !== 1 ||
+    !Array.isArray(bundle.tasks) ||
+    !Array.isArray(bundle.sources)
+  )
+    throw new Error("导入文件格式不受支持或结构不完整");
+  if (bundle.tasks.length > 5000 || bundle.sources.length > 20000)
+    throw new Error("导入文件任务或来源数量超出限制");
   const tasks = new Map<string, QueueBundle["tasks"][number]>();
   for (const task of bundle.tasks) {
+    if (
+      !task ||
+      typeof task !== "object" ||
+      typeof task.url !== "string" ||
+      !["pending", "failed"].includes(task.state)
+    )
+      throw new Error("导入文件中的任务项格式无效");
     const url = portableUrl(task.url);
-    const diagnostic = task.issue && issue(task.issue);
+    const diagnostic = task.issue ? issue(task.issue) : undefined;
     const previous = tasks.get(url);
     tasks.set(url, {
       url,
@@ -81,6 +136,14 @@ export function normalizeBundle(bundle: QueueBundle): QueueBundle {
   }
   const sources = new Map<string, QueueBundle["sources"][number]>();
   for (const source of bundle.sources) {
+    if (
+      !source ||
+      typeof source !== "object" ||
+      typeof source.parent !== "string" ||
+      typeof source.child !== "string" ||
+      typeof source.required !== "boolean"
+    )
+      throw new Error("导入文件中的来源关系格式无效");
     const normalized = {
       parent: portableUrl(source.parent),
       child: portableUrl(source.child),
@@ -93,7 +156,10 @@ export function normalizeBundle(bundle: QueueBundle): QueueBundle {
   return {
     format: "course-pilot.tasks",
     version: 1,
-    exportedAt: bundle.exportedAt,
+    exportedAt:
+      typeof bundle.exportedAt === "string"
+        ? bundle.exportedAt
+        : new Date().toISOString(),
     tasks: [...tasks.values()],
     sources: [...sources.values()],
   };

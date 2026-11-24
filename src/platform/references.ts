@@ -1,21 +1,27 @@
-import { mkdir, writeFile, rename, rm } from "node:fs/promises";
+import { mkdir, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { PLATFORM } from "../config.ts";
 import { platformHost, entry } from "../domain/identity.ts";
 import { PlatformHttp } from "../browser/http.ts";
-import { atomicJson, atomicText } from "../storage/files.ts";
+import { atomicJson, atomicText, renameWithRetry } from "../storage/files.ts";
 import type { Task } from "../storage/repository.ts";
 import { AuthenticationError, list, token } from "../utils.ts";
 import { subjectManifest, type DiscoveryContext } from "./discovery.ts";
 import { courseInfo } from "./learning.ts";
 import { ReferenceCache, checksum } from "./reference-cache.ts";
-import type { Tab } from "nodriver-ts";
+import { DisconnectedError, InputBlockedError, type Tab } from "nodriver-ts";
 export const MAX_BYTES = 128 * 1024 * 1024;
 export function filename(name: string) {
-  const s = name
-    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
-    .replace(/[. ]+$/, "")
-    .slice(0, 100);
+  const cleaned = name.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_");
+  let truncated = "";
+  let bytes = 0;
+  for (const ch of cleaned) {
+    const size = Buffer.byteLength(ch, "utf8");
+    if (bytes + size > 60) break;
+    truncated += ch;
+    bytes += size;
+  }
+  const s = truncated.replace(/[. ]+$/, "");
   return !s || /^(?:CON|PRN|AUX|NUL|COM\d|LPT\d)(?:\.|$)/i.test(s)
     ? `_${s || "资料"}`
     : s;
@@ -48,7 +54,9 @@ export function decodeDocument(
   }
   if (raw.subarray(0, 5).toString() === "%PDF-")
     return { bytes: raw, ext: "pdf" };
-  ext = ext.toLowerCase().replace(/^\./, "");
+  ext = String(ext || "")
+    .toLowerCase()
+    .replace(/^\./, "");
   if (
     ["doc", "ppt"].includes(ext) &&
     raw.subarray(0, 8).equals(Buffer.from("d0cf11e0a1b11ae1", "hex"))
@@ -129,7 +137,7 @@ export async function downloadFile(
         chunks.push(Buffer.from(value));
       }
     } finally {
-      await reader.cancel();
+      await reader.cancel().catch(() => {});
     }
     return Buffer.concat(chunks);
   }
@@ -180,9 +188,11 @@ export async function references(
           ...(info.courseAttachments || []).map((a: any) => ({
             ...a,
             attachmentId: a.attachmentId || a.id,
-            fileType: String(a.name || "")
-              .split(".")
-              .at(-1),
+            fileType:
+              a.fileType ||
+              (String(a.name || "").includes(".")
+                ? String(a.name).split(".").at(-1)
+                : ""),
           })),
         ];
         const seen = new Set<string>();
@@ -204,19 +214,26 @@ export async function references(
                 throw new Error("课件预览地址缺失");
               const auth = await api.authorization();
               ctx.auth.assert(ctx.lease);
+              const previewExt = [preview.extention, preview.type]
+                .map((v) =>
+                  String(v || "")
+                    .toLowerCase()
+                    .replace(/^\./, ""),
+                )
+                .find((v) => ["pdf", "doc", "docx", "ppt", "pptx"].includes(v));
               const file = decodeDocument(
                 await downloadFile(preview.url, auth, ctx.lease.signal),
-                preview.extention || preview.type || ext,
+                previewExt || ext,
               );
               ctx.auth.assert(ctx.lease);
-              const name = `${filename(`${info.name || course.businessId}-${s.name || id}`)}-${checksum(JSON.stringify([course.businessId, id]))}.${file.ext}`,
+              const name = `${filename(`${info.name || course.businessId}-${s.name || id}`)}-${checksum(JSON.stringify([course.businessId, id])).slice(0, 16)}.${file.ext}`,
                 path = join(output, name),
-                tmp = `${path}.${token()}.tmp`;
+                tmp = `${path}.${token().slice(0, 12)}.tmp`;
               try {
                 await writeFile(tmp, file.bytes, { flag: "wx" });
-                await rename(tmp, path);
+                await renameWithRetry(tmp, path);
               } finally {
-                await rm(tmp, { force: true });
+                await rm(tmp, { force: true }).catch(() => {});
               }
               cache.put({
                 course: course.businessId,
@@ -237,7 +254,7 @@ export async function references(
                   `/api/v1/course-study/guide-study/get-guide-study-info?courseId=${course.businessId}&attachmentId=${encodeURIComponent(id)}`,
                 ),
               );
-              const name = `${filename(`${info.name || course.businessId}-导学`)}-${checksum(JSON.stringify([course.businessId, id]))}.json`;
+              const name = `${filename(`${info.name || course.businessId}-导学`)}-${checksum(JSON.stringify([course.businessId, id])).slice(0, 16)}.json`;
               ctx.auth.assert(ctx.lease);
               await atomicJson(join(output, name), items);
               const markdown = name.replace(/\.json$/, ".md");
@@ -268,18 +285,28 @@ export async function references(
             }
             cache.clearFailure(course.businessId, id);
           } catch (e) {
-            if (ctx.lease.signal.aborted || e instanceof AuthenticationError)
+            if (
+              ctx.lease.signal.aborted ||
+              e instanceof AuthenticationError ||
+              e instanceof DisconnectedError ||
+              e instanceof InputBlockedError
+            )
               throw e;
             cache.fail(course.businessId, e, id);
           }
           await cache.save();
         }
       } catch (e) {
-        if (ctx.lease.signal.aborted || e instanceof AuthenticationError)
+        if (
+          ctx.lease.signal.aborted ||
+          e instanceof AuthenticationError ||
+          e instanceof DisconnectedError ||
+          e instanceof InputBlockedError
+        )
           throw e;
         cache.fail(course.businessId, e);
       } finally {
-        await tab?.close();
+        await tab?.close().catch(() => {});
         await cache.save();
       }
     }
@@ -291,6 +318,6 @@ export async function references(
     await cache.save();
     throw error;
   } finally {
-    await root?.close();
+    await root?.close().catch(() => {});
   }
 }
