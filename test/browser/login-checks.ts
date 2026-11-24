@@ -41,7 +41,7 @@ export async function loginChecks(runtime: BrowserRuntime) {
     </script>`);
   });
   await new Promise<void>((resolve) => server.listen(0, resolve));
-  const signal = AbortSignal.timeout(60000),
+  const signal = AbortSignal.timeout(90000),
     scope = runtime.scope(signal);
   try {
     const tab = await scope.open(
@@ -159,15 +159,14 @@ export async function loginChecks(runtime: BrowserRuntime) {
       const session = frame.session;
       const send = session.sendWith;
       let hidden = false;
-      let scrollFailure: unknown;
+      const scrollFailures: unknown[] = [];
       session.sendWith = (async (...args: Parameters<typeof send>) => {
         const [method, , params] = args;
-        if (
-          !hidden &&
+        const forTarget =
           method === "DOM.scrollIntoViewIfNeeded" &&
-          (params as { backendNodeId: number }).backendNodeId ===
-            target.backendNodeId
-        ) {
+          (params as { backendNodeId?: number })?.backendNodeId ===
+            target.backendNodeId;
+        if (!hidden && forTarget) {
           hidden = true;
           // Keep the node attached, but remove its layout after observation.
           await frame.evaluate((selector) => {
@@ -177,14 +176,22 @@ export async function loginChecks(runtime: BrowserRuntime) {
         try {
           return await send.apply(session, args);
         } catch (error) {
-          if (method === "DOM.scrollIntoViewIfNeeded") scrollFailure = error;
+          if (forTarget) scrollFailures.push(error);
           throw error;
         }
       }) as typeof send;
       try {
         await applyLoginPreferences(tab, signal);
         assert.equal(hidden, true);
-        assert.ok(scrollFailure instanceof ProtocolError);
+        // nodriver-ts 1.1.2 retries no-layout scroll errors until the action
+        // budget expires, so the final attempt can reject with TimeoutError.
+        const scrollFailure = scrollFailures.find(
+          (error) => error instanceof ProtocolError,
+        );
+        assert.ok(
+          scrollFailure instanceof ProtocolError,
+          `expected ProtocolError for ${selector}, got: ${scrollFailures.map(String).join("; ")}`,
+        );
         assert.match(
           scrollFailure.message,
           /Node does not have a layout object/,

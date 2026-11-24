@@ -2,6 +2,7 @@ import {
   ActionabilityError,
   InputActionError,
   isContextGone,
+  isFrameGone,
   SessionEndedError,
   StaleElementError,
   TimeoutError,
@@ -105,6 +106,7 @@ export async function applyLoginPreferences(tab: Tab, signal: AbortSignal) {
         error instanceof ActionabilityError ||
         error instanceof TimeoutError ||
         isContextGone(error) ||
+        isFrameGone(error) ||
         (error instanceof SessionEndedError && !tab.closed)
       )
         continue;
@@ -144,6 +146,7 @@ export async function waitForLoginReturn(tab: Tab, signal: AbortSignal) {
         error instanceof TimeoutError ||
         error instanceof StaleElementError ||
         isContextGone(error) ||
+        isFrameGone(error) ||
         (error instanceof SessionEndedError && !tab.closed)
       ))
         throw error;

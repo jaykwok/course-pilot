@@ -2,6 +2,7 @@ import {
   EvaluationError,
   FetchCancelledError,
   isContextGone,
+  isFrameGone,
   StaleElementError,
   type FetchResponse,
   type Tab,
@@ -116,7 +117,8 @@ export class PlatformHttp {
           (error instanceof EvaluationError &&
             /Failed to fetch|NetworkError/i.test(error.message)) ||
           error instanceof StaleElementError ||
-          isContextGone(error);
+          isContextGone(error) ||
+          isFrameGone(error);
         if (transient && attempt + 1 < attempts) {
           await sleep(250 * 2 ** attempt, this.lease.signal);
           continue;

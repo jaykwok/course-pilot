@@ -611,19 +611,14 @@ export class Application extends EventEmitter {
           collected.add(task.id);
           report(`已记录 ${collected.size} 个任务`);
         };
-        const off = this.browser.browser.cdp.on(
-          "Target.targetInfoChanged",
-          ({ targetInfo }) => {
-            if ([...scope.tabs].some((t) => t.id === targetInfo.targetId)) {
-              try {
-                record(targetInfo.url);
-              } catch (e) {
-                this.abort?.abort(e);
-                this.promptWaiter?.reject(e);
-              }
-            }
-          },
-        );
+        const off = scope.navigated.on(({ url }) => {
+          try {
+            record(url);
+          } catch (e) {
+            this.abort?.abort(e);
+            this.promptWaiter?.reject(e);
+          }
+        });
         try {
           const input = parseLinkInput(
             String(payload.input_text || "").trim() || HOME,

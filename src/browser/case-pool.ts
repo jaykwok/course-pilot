@@ -2,6 +2,7 @@ import {
   ActionabilityError,
   InputActionError,
   isContextGone,
+  isFrameGone,
   SessionEndedError,
   StaleElementError,
   TimeoutError,
@@ -26,6 +27,7 @@ export async function waitForCasePoolSession(
     error instanceof StaleElementError ||
     error instanceof ActionabilityError ||
     isContextGone(error) ||
+    isFrameGone(error) ||
     (error instanceof SessionEndedError && !tab.closed);
   while (Date.now() < deadline) {
     guard();

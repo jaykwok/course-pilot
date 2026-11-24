@@ -15,17 +15,7 @@ const loopback = (host: string) =>
   ["127.0.0.1", "localhost", "::1", "[::1]"].includes(
     host.replace(/^\./, "").toLowerCase(),
   );
-
-function validClearDomain(raw: string): string | undefined {
-  const host = raw.replace(/^\./, "").trim();
-  if (!host || host.includes(":")) return undefined;
-  try {
-    const parsed = new URL(`http://${host}/`).hostname;
-    return parsed && !loopback(parsed) ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
-}
+const LOOPBACK_DOMAINS = ["127.0.0.1", "localhost", "[::1]"];
 
 export const FORBIDDEN_CDP = new Set([
   "Runtime.enable",
@@ -54,8 +44,8 @@ export async function executable(override?: string): Promise<string> {
   }
   try {
     return await findExecutable(
-      !process.env.CHROME_PATH && process.platform === "win32"
-        ? { prefer: ["edge", "chrome", "chromium"] }
+      process.platform === "win32"
+        ? { prefer: ["edge", "chrome", "chromium"], respectEnv: true }
         : undefined,
     );
   } catch {
@@ -77,7 +67,6 @@ export class BrowserRuntime {
     "https://www.ctexpert.cn",
     "https://ctexpert.cn",
   ]);
-  private unsubscribe: () => void;
   private unsubscribeErrors: () => void;
   private constructor(browser: Browser, logger: Logger) {
     this.browser = browser;
@@ -89,10 +78,6 @@ export class BrowserRuntime {
         !tab.closed &&
         tab.url === "about:blank" &&
         !browser.targetInfo.get(tab.id)?.openerId,
-    );
-    this.unsubscribe = browser.cdp.on(
-      "Target.targetInfoChanged",
-      ({ targetInfo }) => this.note(targetInfo.url),
     );
     this.unsubscribeErrors = browser.errors.on((error) =>
       logger.log(error, "warn"),
@@ -204,22 +189,14 @@ export class BrowserRuntime {
         for (const origin of tab.origins) this.note(origin);
         closing.adopt(tab);
       }
-    await closing.close();
+    await closing.close({ timeout: 30000, signal });
     this.retained.clear();
     signal?.throwIfAborted();
-    const domains = new Set<string>();
-    for (const origin of this.origins) {
-      const host = validClearDomain(new URL(origin).hostname);
-      if (host) domains.add(host);
-    }
-    for (const cookie of await this.context.cookies()) {
-      const host = validClearDomain(cookie.domain);
-      if (host) domains.add(host);
-    }
     try {
       return await this.context.clearSiteData({
-        domains: [...domains],
+        allKnown: true,
         origins: [...this.origins],
+        excludeDomains: LOOPBACK_DOMAINS,
         // Closing business tabs discarded their sessionStorage. Do not use its
         // history-based matching on the reused local management page.
         types: [
@@ -243,7 +220,6 @@ export class BrowserRuntime {
     }
   }
   async close() {
-    this.unsubscribe();
     this.unsubscribeErrors();
     await this.browser.close();
   }
@@ -268,6 +244,9 @@ export class TabScope {
   }
   get tabs(): Tab[] {
     return [...this.pages.tabs, ...this.borrowed].filter((tab) => !tab.closed);
+  }
+  get navigated() {
+    return this.pages.navigated;
   }
   async open(url?: string, timeout = 30000) {
     this.signal.throwIfAborted();

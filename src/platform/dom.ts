@@ -75,11 +75,7 @@ async function waitForOverlayExit(
     ? tab.locator(selector).filter({ hasText: text })
     : tab.locator(selector);
   await overlay.waitFor({ state: "hidden", timeout: remaining(), signal });
-  await tab.waitForFunction(
-    () => document.readyState !== "loading",
-    undefined,
-    { timeout: remaining(), signal, world: "isolated" },
-  );
+  await tab.waitForLoadState("interactive", { timeout: remaining(), signal });
   guard();
 }
 /** Some course gates bind registration to an image ID rather than button text. */

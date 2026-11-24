@@ -1,5 +1,6 @@
 import {
   isContextGone,
+  isFrameGone,
   SessionEndedError,
   StaleElementError,
   TimeoutError,
@@ -336,6 +337,7 @@ export class Authentication {
                 error instanceof StaleElementError ||
                 error instanceof TimeoutError ||
                 isContextGone(error) ||
+                isFrameGone(error) ||
                 (error instanceof SessionEndedError && !tab.closed)
               )
                 return false;

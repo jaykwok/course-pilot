@@ -6,7 +6,8 @@ import {
   PASSWORD_TIME,
   prepareProjectProfile,
 } from "../src/browser/profile.ts";
-import { application, temporary } from "./helpers.ts";
+import { application, COURSE, EXAM, temporary } from "./helpers.ts";
+import { token } from "../src/utils.ts";
 import { atomicJson } from "../src/storage/files.ts";
 import { accountId } from "../src/domain/identity.ts";
 import { Browser, ClearSiteDataError, ProfileInUseError } from "nodriver-ts";
@@ -332,12 +333,53 @@ test("cancellation closes a tab even when creation finishes after the task stops
     await f.close();
   }
 });
-test("session clearing targets a page CDP session and preserves the management page", async () => {
+test("session clearing targets a page CDP session, clears all known third-party sites and preserves loopback", async () => {
   const f = await application();
   try {
     const admin = await f.runtime.context.newTab();
     f.runtime.management = admin;
-    f.chrome.handle("Storage.getCookies", () => ({ cookies: [] }));
+    let cookieReads = 0;
+    const deletedCookies: string[] = [];
+    let cookies: Protocol.Network.Cookie[] = [
+      {
+        name: "course_web",
+        value: "admin",
+        domain: "127.0.0.1",
+        path: "/",
+        expires: -1,
+        size: 15,
+        httpOnly: true,
+        secure: false,
+        session: true,
+        priority: "Medium",
+        sourceScheme: "NonSecure",
+        sourcePort: 9999,
+      },
+      {
+        name: "sso_session",
+        value: "third-party",
+        domain: ".sso.other.test",
+        path: "/",
+        expires: -1,
+        size: 22,
+        httpOnly: true,
+        secure: true,
+        session: true,
+        priority: "Medium",
+        sourceScheme: "Secure",
+        sourcePort: 443,
+      },
+    ];
+    f.chrome.handle("Storage.getCookies", () => {
+      cookieReads++;
+      return { cookies: [...cookies] };
+    });
+    f.chrome.handle("Network.deleteCookies", ({ name, domain }) => {
+      deletedCookies.push(`${name}@${domain}`);
+      cookies = cookies.filter(
+        (c) => !(c.name === name && c.domain === domain),
+      );
+    });
     f.chrome.handle("Page.getNavigationHistory", () => ({
       currentIndex: 1,
       entries: [
@@ -359,6 +401,12 @@ test("session clearing targets a page CDP session and preserves the management p
     f.runtime.note("https://sso.example.test/login");
     await f.runtime.clearPlatform();
     assert.equal(admin.closed, false);
+    assert.equal(cookieReads, 2);
+    assert.deepEqual(deletedCookies, ["sso_session@.sso.other.test"]);
+    assert.deepEqual(
+      cookies.map((c) => `${c.name}@${c.domain}`),
+      ["course_web@127.0.0.1"],
+    );
     assert.ok(origins.includes("https://sso.example.test"));
     assert.ok(origins.includes("https://www.ctexpert.cn"));
     assert.ok(origins.includes("https://ctexpert.cn"));
@@ -470,38 +518,7 @@ test("executable delegates override validation and preserves CHROME_PATH precede
 test("management tab emits onClose when its target is destroyed", async () => {
   const f = await application();
   try {
-    const startup = f.browser.tabs[0];
-    f.chrome.handle("Page.navigate", ({ url }, command) => {
-      f.chrome.emit(
-        "Page.frameNavigated",
-        {
-          frame: {
-            id: startup.mainFrame.id,
-            loaderId: "mgmt",
-            url,
-            domainAndRegistry: "",
-            securityOrigin: new URL(url).origin,
-            mimeType: "text/html",
-            secureContextType: "Secure",
-            crossOriginIsolatedContextType: "NotIsolated",
-            gatedAPIFeatures: [],
-          } as Protocol.Page.Frame,
-          type: "Navigation",
-        },
-        command.sessionId,
-      );
-      f.chrome.emit(
-        "Page.lifecycleEvent",
-        {
-          frameId: startup.mainFrame.id,
-          loaderId: "mgmt",
-          name: "DOMContentLoaded",
-          timestamp: 1,
-        },
-        command.sessionId,
-      );
-      return { frameId: startup.mainFrame.id, loaderId: "mgmt" };
-    });
+    f.chrome.handleNavigation();
     f.chrome.handle("Page.bringToFront", () => undefined);
     const management = await f.runtime.openManagement(
       "http://127.0.0.1:18765/",
@@ -518,6 +535,46 @@ test("management tab emits onClose when its target is destroyed", async () => {
     } finally {
       off();
     }
+    f.chrome.assertDone();
+  } finally {
+    await f.close();
+  }
+});
+
+test("select operation records cross-document and same-document navigations through TabScope.navigated", async (t) => {
+  const f = await application();
+  try {
+    f.chrome.handleNavigation();
+    f.chrome.handle("Page.bringToFront", () => undefined);
+    let activeTab: any;
+    t.mock.method(f.app.auth, "lease", async (scope: any) => ({
+      account: "select-account",
+      generation: 0,
+      fingerprint: "fixture",
+      signal: scope.signal,
+    }));
+    t.mock.method(f.app.auth, "assert", () => {});
+    t.mock.method(f.app.auth, "navigate", async (scope: any, url: string) => {
+      activeTab = await scope.open(url);
+      return activeTab;
+    });
+    t.mock.method(f.app, "prompt", async () => {
+      f.chrome.commitNavigation(activeTab.session.id, COURSE);
+      f.chrome.commitNavigation(activeTab.session.id, EXAM, {
+        sameDocument: true,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return true;
+    });
+    f.app.command(token(), "operation", {
+      kind: "select",
+      input_text: "https://kc.zhixueyun.com/#/study/course/list",
+    });
+    await f.app.settled();
+    assert.equal(f.repo.queue("select-account", "learn").length, 1);
+    assert.equal(f.repo.queue("select-account", "exam").length, 1);
+    assert.equal(f.app.view.summary.title, "选择结果");
+    assert.deepEqual(f.app.view.summary.rows, [["已记录任务", 2]]);
     f.chrome.assertDone();
   } finally {
     await f.close();

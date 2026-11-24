@@ -131,8 +131,8 @@ test("archive and registration overlays use Element.isEnabled and Locator.waitFo
         },
       };
     },
-    async waitForFunction(_fn: unknown, _arg: unknown, options: any) {
-      assert.equal(options.world, "isolated");
+    async waitForLoadState(state: string) {
+      assert.equal(state, "interactive");
       readyChecks++;
     },
   } as unknown as Tab;
@@ -163,7 +163,8 @@ test("archive and registration overlays use Element.isEnabled and Locator.waitFo
         },
       };
     },
-    async waitForFunction() {
+    async waitForLoadState(state: string) {
+      assert.equal(state, "interactive");
       readyChecks++;
     },
   } as unknown as Tab;
@@ -193,23 +194,23 @@ test("chapter activation reacquires replaced rows but never replays partially di
           ? false
           : { challenge: false, title: "课程", notices: [] };
       },
-      async queryAll() {
-        return [];
+      async queryAll(selector: string) {
+        if (!selector.includes(".section-item-wrapper")) return [];
+        lookups++;
+        return [
+          {
+            async evaluate() {
+              return false;
+            },
+            async click() {
+              if (lookups === 1) throw failure;
+              focused = true;
+            },
+          },
+        ];
       },
       locator(selector: string) {
         return new Locator(() => tab as any, selector);
-      },
-      async waitForSelector() {
-        lookups++;
-        return {
-          async evaluate() {
-            return false;
-          },
-          async click() {
-            if (lookups === 1) throw failure;
-            focused = true;
-          },
-        };
       },
       async waitForFunction() {
         assert.equal(focused, true);
@@ -351,8 +352,18 @@ test("already active chapters are not clicked again during automatic startup", a
 test("chapter activation never replays a click when the platform does not confirm focus", async () => {
   let clicks = 0;
   const tab = {
-    async queryAll() {
-      return [];
+    async queryAll(selector: string) {
+      if (!selector.includes(".section-item-wrapper")) return [];
+      return [
+        {
+          async evaluate() {
+            return false;
+          },
+          async click() {
+            clicks++;
+          },
+        },
+      ];
     },
     async evaluate(_fn: unknown, arg: unknown) {
       return typeof arg === "string"
@@ -361,16 +372,6 @@ test("chapter activation never replays a click when the platform does not confir
     },
     locator(selector: string) {
       return new Locator(() => tab as any, selector);
-    },
-    async waitForSelector() {
-      return {
-        async evaluate() {
-          return false;
-        },
-        async click() {
-          clicks++;
-        },
-      };
     },
     async waitForFunction() {
       throw new TimeoutError("focus not confirmed");

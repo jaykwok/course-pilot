@@ -104,6 +104,11 @@ test("case-pool SSO retries transient context loss, StaleElementError and OOPIF 
       -32000,
       "Inspected target navigated or closed",
     ),
+    new ProtocolError(
+      "Page.createIsolatedWorld",
+      -32000,
+      "No frame with given id",
+    ),
     new StaleElementError("frame detached"),
     new SessionEndedError("detached", "iframe-target-1"),
   ];
@@ -123,7 +128,7 @@ test("case-pool SSO retries transient context loss, StaleElementError and OOPIF 
       },
     ],
     async waitForFunction() {
-      if (checks++ < 4) throw new TimeoutError("redirect pending");
+      if (checks++ < 5) throw new TimeoutError("redirect pending");
       return true;
     },
   } as unknown as Tab;
@@ -134,7 +139,7 @@ test("case-pool SSO retries transient context loss, StaleElementError and OOPIF 
     2000,
   );
   assert.equal(errors.length, 0);
-  assert.equal(checks, 5);
+  assert.equal(checks, 6);
 
   const disconnected = {
     closed: false,
